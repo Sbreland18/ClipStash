@@ -11,6 +11,16 @@
 ; Output lands in installer_output\ClipStash-Setup-<version>.exe
 
 #define AppName        "ClipStash"
+
+; The version arrives in a small file that build.py generates from version.py.
+; It used to be passed on the command line as /DAppVersion, which turned out to
+; have no safe form: quoted, the quote characters became part of the value and
+; VersionInfoVersion rejected it; unquoted, the preprocessor tried to evaluate
+; 1.0.0 as an arithmetic expression. A generated include sidesteps both.
+; Compiling this script by hand without build.py falls back to the literal below.
+#if FileExists(AddBackslash(SourcePath) + "version.iss")
+  #include "version.iss"
+#endif
 #ifndef AppVersion
   #define AppVersion   "1.0.0"
 #endif
