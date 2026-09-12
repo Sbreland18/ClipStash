@@ -1,0 +1,10 @@
+Version 1.0.0
+
+First release.
+
+- Download single videos or entire playlists from YouTube
+- Choose quality, or extract audio only as MP3
+- Skip videos you've already downloaded, so re-running a playlist
+  only fetches what's new
+- Subtitles, metadata and cover art can be embedded into files
+- ffmpeg bundled, so high-quality downloads work out of the box

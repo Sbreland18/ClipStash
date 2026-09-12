@@ -1,0 +1,39 @@
+# --- Build output -----------------------------------------------------------
+# All rebuildable, and far too large for a repo.
+build/
+dist/
+installer_output/
+*.spec.bak
+
+# --- Bundled ffmpeg ---------------------------------------------------------
+# IMPORTANT: ffmpeg.exe and ffprobe.exe are roughly 127 MB each, which is over
+# GitHub's 100 MB per-file limit. Committing them gets the push rejected, and
+# removing them from history afterwards is genuinely painful. They're fetched
+# on demand by:  build.py --with-ffmpeg
+vendor/
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Editors and OS ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Runtime ----------------------------------------------------------------
+# The downloaded-video archive, if anyone ever points a download at the repo.
+.clipstash-archive.txt
+
+# --- NOT ignored, deliberately ----------------------------------------------
+# assets/*.ico, *.png, *.icns and *.bmp ARE committed, even though they're
+# generated. Regenerating them needs cairosvg, which usually can't be installed
+# on Windows because it depends on Cairo's DLLs. Keeping the rendered files in
+# the repo means a Windows checkout can build without it. They total under 3 MB.
