@@ -5,297 +5,368 @@ A desktop app for downloading YouTube videos and playlists, built on
 
 Only download content you have the rights to — your own uploads, Creative
 Commons material, or anything the rights holder permits. Bulk downloading
-copyrighted material generally violates YouTube's Terms of Service.
+copyrighted material generally violates YouTube's Terms of Service. If you are
+distributing this inside an organisation, that is worth raising with whoever
+handles policy before it spreads.
+
+---
+
+## Who runs what
+
+Easy to conflate, so stated plainly up front:
+
+- **`build_gui.pyw`, `build.bat`, `build.py`** are *developer* tools. They
+  compile the app. The people you give ClipStash to never see them.
+- **`ClipStash-Setup-<version>.exe`** is what users run. An ordinary GUI
+  installer wizard.
+
+---
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `clipstash.py` | The application. Runs directly with `python clipstash.py`. |
-| `updater.py` | Self-updater for the bundled yt-dlp. Imported by the app; also runnable standalone. |
-| `theme.py` | Colour palette and ttk theme, shared by the app and the build tool. |
-| `version.py` | The version number. The only place it's written down. |
-| `app_update.py` | In-app self-update: checks the feed, verifies the download, hands off to the installer. |
-| `RELEASE_NOTES.txt` | What changed. Copied into the update manifest and shown to users. |
-| `clipstash.spec` | PyInstaller build definition. |
-| `build.py` | Build driver — checks prerequisites, vendors ffmpeg, runs PyInstaller and Inno Setup. |
+| `clipstash.py` | The application. Run directly with `python clipstash.py`. |
+| `version.py` | The version number. The only place it is written down. |
+| `theme.py` | Colour palette, ttk theme, and the tooltip class. |
+| `settings.py` | Saves and restores the user's options. |
+| `applog.py` | Per-session log files on disk. |
+| `history.py` | Record of what has been downloaded and where. |
+| `crashhandler.py` | Turns unexpected errors into a readable message plus a log entry. |
+| `updater.py` | Keeps the bundled yt-dlp current. Also resolves portable mode. |
+| `app_update.py` | In-app self-update: checks the feed, verifies, hands off to the installer. |
 | `build_gui.pyw` | Window-based front end for `build.py`. Double-click it; no console. |
-| `build.bat` | Double-clickable launcher for `build.py`, for when you'd rather see the console. |
-| `installer.iss` | Inno Setup script that produces the Windows installer. |
-| `assets/icon.svg` | Source artwork: the robber and his sack of televisions. |
-| `assets/icon-small.svg` | Simplified mark used below 48px, where the full scene stops being legible. |
-| `assets/make_icons.py` | Renders the SVGs into `icon.ico`, `icon.icns`, `icon.png` and the installer's wizard BMPs. |
+| `build.bat` | Console launcher for `build.py`, if you prefer watching the output. |
+| `build.py` | Build driver — prerequisites, ffmpeg, PyInstaller, Inno Setup, manifest. |
+| `clipstash.spec` | PyInstaller build definition. |
+| `installer.iss` | Inno Setup script producing the Windows installer. |
+| `RELEASE_NOTES.txt` | What changed. Copied into the update manifest and shown to users. |
+| `portable.txt.example` | Rename to `portable.txt` to enable portable mode. |
+| `assets/` | Artwork: source SVGs, generated icons, installer wizard images. |
 
-Keep `clipstash.py`, `updater.py`, `clipstash.spec`, `build.py` and `installer.iss`
-in one directory, with `assets/` beside them.
+Keep everything except `assets/` in one folder, with `assets/` beside it.
 
-## Who runs what
+---
 
-Worth being clear, because it's easy to conflate: **`build.py`, `build_gui.pyw`
-and `build.bat` are developer tools.** People you give the app to never see
-them. They run `ClipStash-Setup-<version>.exe`, which is an ordinary GUI
-installer wizard.
+## What the app does
+
+**Downloading.** Single videos or entire playlists. Quality from 4K down to
+360p, audio-only as MP3 or in the original format, or **subtitles / transcript
+only** — which fetches just the captions and no video at all, turning a
+500 MB download into a few kilobytes of text.
+
+**Queue.** Add as many links as you like and leave it running. Titles, channel
+names and playlist sizes fill in automatically so you can see what you queued.
+A failure doesn't stop the batch, and **Retry failed** puts anything that didn't
+finish back in the queue — for videos that failed inside a playlist, it requeues
+exactly those rather than walking the whole playlist again.
+
+**Getting links in.** Type or paste one, paste several at once, drag a link onto
+the window, or switch on **Watch clipboard** and every YouTube address you copy
+while browsing queues itself.
+
+**Trimming and cleaning.** **Clip section** downloads only part of a video by
+start and end time. **Remove sponsors** strips sponsor readings, self-promotion,
+intros and outros via the SponsorBlock database. **Split at chapters** turns one
+long video into a file per chapter.
+
+**Being considerate.** **Start at** holds a queue until a set time, for running
+large batches outside busy hours. **Pause** stops a download without losing
+progress and resumes where it left off.
+
+**Keeping track.** Every finished file is recorded in **History** with its
+location. Queueing something you already have gets flagged with the date you got
+it. ClipStash warns before starting if a queue looks likely to fill the drive,
+and flashes in the taskbar when a queue finishes while you're in another window.
+
+---
+
+## Where user data lives
+
+| Platform | Location |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\ClipStash\` |
+| macOS | `~/Library/Application Support/ClipStash/` |
+| Linux | `~/.local/share/ClipStash/` |
+
+Containing `settings.json`, `history.json`, `logs/`, and `runtime/` (downloaded
+yt-dlp updates).
+
+### Portable mode
+
+Rename `portable.txt.example` to `portable.txt` and put it next to
+`ClipStash.exe`. Everything above then lives in a `Data` folder beside the
+program instead, so the whole installation travels on a USB stick.
+
+Because settings, logs, history and the yt-dlp runtime all derive their location
+from one function in `updater.py`, that single marker moves the lot. The folder
+is tested for writability before being accepted, so a write-protected stick
+fails visibly rather than silently discarding every save.
+
+Nothing is migrated automatically when you switch. Copy the `Data` folder
+yourself if you want to keep your history.
+
+---
 
 ## Building
 
-Easiest: double-click **`build_gui.pyw`**. It opens a window, you tick the
-options you want, press Build, and watch the output in the panel. No console.
+Easiest: double-click **`build_gui.pyw`**. Tick your options, press Build, watch
+the log panel. No console.
 
-If double-clicking it opens a text editor instead of running, right-click the
-file, choose Open with, and pick Python. Or use `build.bat`, which does the same
-thing in a console window.
+If double-clicking opens a text editor instead, right-click → Open with →
+Python. Or use `build.bat`, which does the same thing in a console window.
 
 From a terminal:
 
 ```
-python build.py
+python build.py --onedir --extras --with-ffmpeg --installer
 ```
 
-That produces `dist/ClipStash` (or `ClipStash.exe` / `ClipStash.app`).
-
-**PyInstaller does not cross-compile.** Run the build on Windows to get a
-`.exe`, on macOS for a `.app`, on Linux for an ELF binary. A Linux binary is
-also tied to the glibc version of the machine that built it, so build on the
-oldest distro you intend to support.
+**PyInstaller does not cross-compile.** Build on Windows for a `.exe`, on macOS
+for a `.app`, on Linux for an ELF binary. A Linux binary is also tied to the
+glibc version of the machine that built it.
 
 ### Options
 
 | Flag | Effect |
 | --- | --- |
-| `--with-ffmpeg` | Copy `ffmpeg`/`ffprobe` from your PATH into the bundle |
-| `--onedir` | Folder build instead of one file — starts in ~1s instead of ~5s |
-| `--debug` | Keep a console window attached so tracebacks are visible |
+| `--installer` | Compile `installer.iss` into a setup `.exe` (needs Inno Setup) |
+| `--with-ffmpeg` | Bundle ffmpeg: copy from PATH, or download a static build |
+| `--fetch-ffmpeg` | Always download a static ffmpeg, ignoring any on PATH |
+| `--extras` | Install yt-dlp's optional companions before building |
+| `--onedir` | Folder build — starts faster, and what the installer expects |
+| `--manifest` | Regenerate `latest.json` only, without rebuilding |
+| `--debug` | Keep a console attached to the built app |
 | `--clean` | Wipe `build/` and `dist/` first |
-| `--no-install` | Fail on missing build deps instead of pip-installing them |
 
-Expect roughly 25 MB without ffmpeg, or 100–150 MB with it bundled.
+Expect roughly 25 MB without ffmpeg, or 100–200 MB with it bundled.
+
+### Testing a folder build
+
+`ClipStash.exe` and the `_internal` folder are **one unit**. Copying the exe on
+its own produces "Failed to load Python DLL", because it looks for `_internal`
+beside itself. Run it in place, or copy the whole folder.
+
+---
 
 ## Making an installer
-
-For handing this to people who shouldn't have to think about it:
 
 ```
 python build.py --onedir --with-ffmpeg --installer
 ```
 
-That produces `installer_output\ClipStash-Setup-1.0.0.exe`, a single file you
-can send someone. It needs [Inno Setup 6](https://jrsoftware.org/isdl.php),
-which is free; `build.py` finds `ISCC.exe` automatically in the usual install
-locations, or you can put it on your PATH.
+Produces `installer_output\ClipStash-Setup-<version>.exe` plus `latest.json`.
+Needs [Inno Setup 6](https://jrsoftware.org/isdl.php), which is free;
+`build.py` finds `ISCC.exe` automatically.
 
-`installer.iss` defaults to a **per-user install** with
-`PrivilegesRequired=lowest`, so it works without admin rights — which matters on
-managed work and school machines. The user can still opt into a machine-wide
-install, which raises a UAC prompt.
+The installer defaults to a **per-user install** (`PrivilegesRequired=lowest`),
+so it works without admin rights — which matters on managed work and school
+machines. Users can still choose a machine-wide install, which raises UAC.
 
-The installer also creates Start Menu and optional desktop shortcuts, blocks
-accidental downgrades over a newer version, and on uninstall asks whether to
-keep the downloaded yt-dlp so a reinstall doesn't have to fetch it again.
+It creates Start Menu and optional desktop shortcuts, blocks accidental
+downgrades, and on uninstall asks whether to keep downloaded yt-dlp updates.
 
-Note `--onedir`: `installer.iss` expects the folder build, since there's no
-reason to pay the onefile unpack delay on every launch when an installer is
-laying files down anyway. If you'd rather ship the single-file build, swap the
-commented `Source:` line in the `[Files]` section.
+`AppMutex` matches a named mutex the app creates at startup. That is how Setup
+notices ClipStash is running and closes it cleanly rather than failing on locked
+files during an in-app update.
 
-Bump `AppVersion` in `installer.iss` for each release. Leave `AppId` alone —
-Windows uses that GUID to recognise upgrades and to find the app at uninstall
-time, so changing it strands the previous install.
+---
 
-## Icons
+## Releasing an update
+
+Users update from inside the app. A running `.exe` can't overwrite itself on
+Windows, so ClipStash downloads your installer, starts it detached, and exits so
+nothing stays locked. The installer swaps the files and reopens the app.
+
+### One-time setup
+
+Put your manifest address in `UPDATE_FEED_URL` at the top of `app_update.py`.
+This GitHub permalink always resolves to the newest release:
+
+```
+https://github.com/OWNER/REPO/releases/latest/download/latest.json
+```
+
+Set `GITHUB_REPO` in the same file to `owner/repo` and the update dialog shows
+the release description you wrote on GitHub, so you can fix a typo in your notes
+without rebuilding. That is only consulted when an update actually exists —
+GitHub allows 60 unauthenticated API calls per hour *per IP address*, shared by
+everyone behind a school or office network.
+
+A plain web server works too, as does a UNC path like
+`\\fileserver\apps\clipstash\latest.json` for distributing internally without
+publishing anything publicly.
+
+Leave `UPDATE_FEED_URL` empty and the update button simply doesn't appear.
+
+### Each release
+
+1. Bump `__version__` in `version.py`.
+2. Describe what changed in `RELEASE_NOTES.txt` — users read this in the update
+   dialog. `build.py` warns if the version it mentions doesn't match the build.
+3. Build with `--installer`.
+4. Upload **both** `ClipStash-Setup-<version>.exe` and `latest.json` to a GitHub
+   release tagged `v<version>`.
+
+Both files, always. Every client verifies its download against the hash in the
+manifest, so a mismatched pair is rejected everywhere.
+
+**Improvements to the update system are invisible for exactly one release.** The
+*currently running* version draws the update dialog, so a change to it only
+shows once users are on a build containing it. Expect this and don't chase it.
+
+### What protects users
+
+The SHA-256 in the manifest proves the download matches what you published,
+catching corruption and tampering in transit. It does **not** prove the manifest
+itself is genuine — that rests on HTTPS. For an internal tool that is usually
+acceptable. If ClipStash goes wider, sign the installer with a code-signing
+certificate; Windows will then reject anything that isn't yours, and the
+SmartScreen warning disappears as a bonus.
+
+---
+
+## The parts that actually cause trouble
+
+**ffmpeg.** YouTube serves high-resolution video and audio as separate streams,
+so without ffmpeg you're capped around 720p, and MP3 conversion, clipping,
+chapter splitting and sponsor removal won't run. The app checks for a bundled
+copy first, then PATH, and warns at startup if it finds neither.
+
+`--with-ffmpeg` copies whatever is on your PATH. Fine on Windows, where builds
+are static. On macOS and Linux, Homebrew and distro builds link against shared
+libraries that won't exist elsewhere — use `--fetch-ffmpeg`, which downloads a
+self-contained static build. The LGPL variant is chosen deliberately: it still
+carries the MP3 encoder, and it is far less onerous if you redistribute.
+Include ffmpeg's `COPYING.LGPLv2.1` alongside the installer to satisfy that.
+
+**Extractors.** yt-dlp imports its ~1750 site extractors dynamically by name, so
+PyInstaller's static analysis misses nearly all of them. The spec pulls them in
+with `collect_submodules`. "Unsupported URL" from a frozen build but not from
+source means that collection broke.
+
+**macOS Gatekeeper.** An unsigned `.app` is quarantined on any Mac but the one
+that built it. Recipients clear it with
+`xattr -dr com.apple.quarantine /Applications/ClipStash.app`.
+
+**Windows SmartScreen.** Unsigned executables *and installers* routinely trip
+SmartScreen and antivirus heuristics. UPX is disabled in the spec because it
+makes this measurably worse. On a managed network, application allowlisting may
+block the installer outright regardless of what the user clicks.
+
+**Staleness.** The bundled yt-dlp freezes at build time, and YouTube changes
+often enough to break it every few weeks. The in-app updater handles this, and
+the app now checks weekly on its own.
+
+---
+
+## Icons and artwork
 
 `assets/icon.svg` is the full scene; `assets/icon-small.svg` is a simplified
-beanie-and-mask mark. Below roughly 48px the full drawing turns to mush, so the
-16, 24 and 32px entries in the `.ico` use the simplified art instead — Windows
-picks whichever size it needs, so the taskbar stays readable while larger
-contexts keep the whole scene.
+mark. Below about 48px the full drawing turns to mush, so the 16, 24 and 32px
+entries in the `.ico` use the simplified art — Windows picks whichever size it
+needs, so the taskbar stays readable while larger contexts keep the scene.
 
-Edit either SVG and regenerate:
+Regenerate after editing either SVG:
 
 ```
 pip install cairosvg pillow
 python assets/make_icons.py
 ```
 
-`build.py` runs this automatically when the artwork is present but the icon
-files aren't.
+That also produces the installer's wizard BMPs — Inno requires BMP, not PNG,
+and picks a size by display scaling, hence several of each.
+
+**The rendered `.ico`, `.png`, `.icns` and `.bmp` files are committed even
+though they are generated**, because cairosvg depends on Cairo's DLLs and
+usually cannot be installed on Windows. Keeping them in the repo means a Windows
+checkout builds without it. `installer.iss` probes for each artwork file before
+referencing it, so a missing one degrades to default artwork rather than
+aborting the compile.
+
+---
 
 ## Theming
 
-`theme.py` holds every colour, each taken from the logo. Change a value there
-and both the app and the build tool follow.
+`theme.py` holds every colour, taken from the logo. Change a value there and the
+app and build tool both follow.
 
-Two Windows-specific things make this work, and both are easy to trip over. The
-default ttk theme there draws widgets with native Win32 calls and ignores
-background settings entirely, so `apply()` switches to `clam` first. And a few
-widgets aren't ttk underneath — a Combobox's dropdown is a plain Tk Listbox
-reachable only via the option database, while `tk.Text` and `tk.Toplevel` need
-colouring directly.
+Two Windows-specific traps. The default ttk theme draws widgets with native
+Win32 calls and ignores background settings, so `apply()` switches to `clam`
+first. And several widgets aren't ttk underneath — a Combobox's dropdown is a
+plain Tk Listbox reachable only via the option database, while `tk.Text` and
+`tk.Toplevel` need colouring directly.
 
-The installer is themed separately, in the `[Code]` section of `installer.iss`.
-Note that Inno's `TColor` is **BGR**, not RGB: `#1B2436` is written `$0036241B`.
-Getting that backwards produces a different colour rather than an error. Only
-the header band and the welcome/finish headings are recoloured — the body pages
-carry native edit boxes and buttons that Windows draws itself and that ignore
-these settings, so darkening them would leave black text on a dark background.
+The queue list needs particular care: Tk leaves entries in the Treeview colour
+map that override selection colours, and `clam` adds its own `selected` entry
+which wins because ttk uses the *first* match. Both are stripped before the
+chosen colour is added. The selection colour is a muted blue rather than the
+accent red, because row tags carry status colours whose foreground wins over the
+selection foreground in Tk 8.6.10+.
 
-## Releasing an update
+The installer is themed separately in the `[Code]` section of `installer.iss`.
+Inno's `TColor` is **BGR**, not RGB: `#1B2436` is written `$0036241B`. Only the
+header band and welcome/finish headings are recoloured — body pages carry native
+controls that ignore these settings, so darkening them would give black text on
+a dark background.
 
-Users get new versions from inside the app. A running `.exe` can't overwrite
-itself on Windows, so ClipStash doesn't try: it downloads your installer, starts
-it detached, and exits so nothing stays locked. The installer swaps the files
-and reopens the app.
+⚠ ISPP, Inno's preprocessor, runs before any Pascal parsing and treats **any
+line whose first non-blank character is `#`** as a directive — including inside
+`{ }` comments. Never let a colour code begin a line in that file.
 
-### One-time setup
+---
 
-Pick somewhere to host two files, then put its address in `UPDATE_FEED_URL` at
-the top of `app_update.py`. Leave it empty and the update button simply doesn't
-appear, so builds without hosting aren't broken.
+## If something goes wrong
 
-GitHub Releases is the easiest option, because this permalink always points at
-the newest release and so never needs changing:
+**Start with the log.** Press **Open logs** in the app. Each run writes a file
+recording the ClipStash version, yt-dlp version, whether ffmpeg was found, and
+everything that happened. Unexpected errors are written there too, with a full
+traceback. This answers most questions without another round of asking.
 
-```
-https://github.com/OWNER/REPO/releases/latest/download/latest.json
-```
+**"Could not copy Chrome cookie database"** — yt-dlp couldn't read browser
+cookies. Two causes, often both: browsers lock the database while running, and
+Chrome/Edge 127+ encrypt cookies in a way yt-dlp cannot decrypt at all. For
+public videos you don't need cookies; set **Sign in via** to None. For private,
+unlisted, members-only or age-restricted content, export a `cookies.txt` with a
+browser extension and select it in **Cookie file**, which overrides the browser
+setting.
 
-Any web server works too. So does a UNC path such as
-`\\fileserver\apps\clipstash\latest.json`, which suits distributing inside an
-organisation without publishing anything publicly.
+**Updates never appear** — a stale manifest looks exactly like "no update
+available". Run `python app_update.py` from the project folder; it prints what
+the feed actually returns, separating a publishing problem from an app problem
+in seconds. Manifest requests are sent uncacheable, but re-uploading
+`latest.json` to the release is the fix if the asset itself went stale.
 
-### Each release
+**Certificate errors** — something is inspecting HTTPS traffic, common on
+managed networks. The updater trusts the OS certificate store first precisely so
+corporate CAs installed by policy work. If it still fails, point `SSL_CERT_FILE`
+at your organisation's root certificate.
 
-1. Bump `__version__` in `version.py`.
-2. Describe what changed in `RELEASE_NOTES.txt` — users read this in the update
-   dialog.
-3. Build with the installer option. `build.py` reads the version, passes it to
-   Inno Setup, and writes `installer_output/latest.json` with the installer's
-   SHA-256.
-4. Upload **both** `ClipStash-Setup-<version>.exe` and `latest.json` to your
-   hosting. They must travel together — every client checks the download against
-   the hash in the manifest, so a mismatched pair is rejected by all of them.
+**Subtitles come back empty** — the video has no captions in the languages
+requested. Automatic captions are enabled, but not every video has even those.
 
-Installed copies check quietly a couple of seconds after launch. If something
-newer exists, the footer button relabels itself and one line appears in the log.
-No popup, deliberately — an interruption on every launch teaches people to
-dismiss it unread.
+**Sponsor removal does nothing** — SponsorBlock is a community database and
+relies on someone having marked up that video. Well-known videos are usually
+covered; obscure ones often aren't.
 
-### What protects users
-
-The SHA-256 in the manifest proves the download matches what you published, so
-corruption and tampering in transit are caught. It does **not** prove the
-manifest itself is genuine; that rests on HTTPS. Anyone able to modify the
-manifest could point it at any executable. For an internal tool that's usually
-acceptable. If ClipStash goes wider, sign the installer with a code-signing
-certificate — Windows will then reject anything that isn't yours, and the
-SmartScreen warning disappears as a bonus.
-
-`AppMutex` in `installer.iss` matches a named mutex the app creates at startup.
-That's how Setup notices ClipStash is running and closes it cleanly rather than
-failing on locked files mid-update.
-
-## The parts that actually cause trouble
-
-**ffmpeg.** YouTube serves high-resolution video and audio as separate streams,
-so without ffmpeg you're capped around 720p and MP3 conversion won't run. The
-app checks for a bundled copy first, then falls back to PATH, and warns at
-startup if it finds neither.
-
-`--with-ffmpeg` copies whatever binary you already have. On Windows that's
-almost always a self-contained static build and works fine. On macOS and Linux,
-Homebrew and distro builds link against shared libraries that won't exist on
-other machines — for a portable build, download a static build
-([Linux](https://johnvansickle.com/ffmpeg), [macOS](https://evermeet.cx/ffmpeg))
-and drop it in `./vendor/` yourself before building.
-
-**Extractors.** yt-dlp imports its ~1750 site extractors dynamically by name,
-so PyInstaller's static analysis misses nearly all of them. The spec pulls them
-in with `collect_submodules`. If you ever see "Unsupported URL" from a frozen
-build but not from the source, that collection is what broke.
-
-**macOS Gatekeeper.** An unsigned `.app` is quarantined on any Mac other than
-the one that built it. The recipient can clear it with:
-
-```
-xattr -dr com.apple.quarantine /Applications/ClipStash.app
-```
-
-Distributing properly means an Apple Developer ID, `codesign --deep --force
---sign`, and notarization via `xcrun notarytool`.
-
-**Windows SmartScreen.** Unsigned PyInstaller executables — and unsigned
-installers — routinely trip SmartScreen and antivirus heuristics — the onefile bootloader unpacking to a
-temp directory looks a lot like packed malware. UPX compression is disabled in
-the spec because it makes this notably worse. A code-signing certificate is the
-only real fix.
-
-**Staleness.** The bundled yt-dlp is frozen at build time, and YouTube changes
-its player often enough that yt-dlp ships fixes most weeks. `updater.py`
-handles this — see below.
-
-## Updating yt-dlp
-
-Click **Update yt-dlp…** in the bottom right. The footer shows which copy is
-live, either `(bundled)` or `(updated)`. An update takes effect at next launch.
-
-Under the hood, `updater.py` downloads yt-dlp's pure-Python wheel straight from
-PyPI, verifies its SHA-256, and unzips it into a per-user directory:
-
-| Platform | Location |
-| --- | --- |
-| Windows | `%LOCALAPPDATA%\ClipStash\runtime\` |
-| macOS | `~/Library/Application Support/ClipStash/runtime/` |
-| Linux | `~/.local/share/ClipStash/runtime/` |
-
-No pip is involved, which matters because a frozen app has no pip and
-`sys.executable` points at the app rather than an interpreter.
-
-Getting the new copy to actually load takes one non-obvious step. PyInstaller
-registers a `FrozenImporter` in `sys.meta_path`, and meta_path finders run
-ahead of anything on `sys.path` — so merely prepending a directory does
-nothing. `updater.activate()` installs a narrow finder in front of the frozen
-one that claims `yt_dlp` and its submodules and nothing else. It must be called
-before `import yt_dlp`, which is why it sits at the top of `clipstash.py`.
-
-Versions install side by side as `yt-dlp-<version>/` rather than overwriting,
-which sidesteps Windows' refusal to replace files mapped into a running
-process. The newest valid one wins at startup; older ones are pruned. If an
-install is corrupt, `activate()` falls back to the bundled copy rather than
-failing to start.
-
-Test the updater without launching the GUI:
-
-```
-python updater.py
-```
-
-## If downloads fail
-
-**"Could not copy Chrome cookie database"** — yt-dlp couldn't read cookies from
-your browser. Two causes, and both may apply at once: browsers lock the cookie
-database while running, and Chrome/Edge 127 and later encrypt cookies in a way
-yt-dlp cannot decrypt at all. If it's the second, closing the browser won't
-help.
-
-For public videos and playlists you don't need cookies — set **Sign in via** to
-None. The app now detects this failure and offers to retry that way. If you
-genuinely need to be signed in, for private, unlisted, members-only or
-age-restricted content, export a `cookies.txt` with a browser extension and
-select it in the **Cookie file** box, which overrides the browser setting.
-
-**Update check fails with a certificate error** — something is inspecting HTTPS
-traffic, which is common on managed work and school networks. The updater
-trusts the OS certificate store first precisely so that corporate CAs installed
-by policy work. If it still fails, point `SSL_CERT_FILE` at your organization's
-root certificate.
+---
 
 ## Troubleshooting a failed build
 
 Check `build/ClipStash/warn-ClipStash.txt` for missing modules, and re-run with
-`--debug` so the console window stays open and shows tracebacks.
+`--debug` so the console stays open.
 
 If `build.py` reports tkinter missing:
 
 - Debian/Ubuntu: `sudo apt install python3-tk`
 - Fedora: `sudo dnf install python3-tkinter`
-- macOS: use the python.org installer, or `brew install python-tk`
+- macOS: python.org installer, or `brew install python-tk`
 - Windows: re-run the Python installer and tick "tcl/tk and IDLE"
+
+If the `py` launcher points at a Python that no longer exists, run `py -0p` to
+see what it thinks is installed. `build.bat` tests each interpreter by running
+it and falls back to any working one.
+
+Drag-and-drop needs `tkinterdnd2`, which is in the recommended packages and
+bundled by the spec. Without it everything works identically minus the drop
+target.
