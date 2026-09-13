@@ -1,0 +1,12 @@
+Rename this file to portable.txt and place it next to ClipStash.exe.
+
+ClipStash will then keep everything it stores - your settings, logs,
+download history and any yt-dlp updates - in a "Data" folder beside the
+program, instead of in your Windows user profile.
+
+That makes the whole installation self-contained, so it can be copied to
+a USB stick and used on another computer with your settings intact.
+
+Delete portable.txt to go back to storing things in the normal place.
+Nothing is moved automatically when you switch, so copy the Data folder
+across yourself if you want to keep your history.

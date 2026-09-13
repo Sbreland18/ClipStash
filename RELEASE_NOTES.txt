@@ -1,10 +1,12 @@
-Version 1.2.0
+Version 1.3.0
 
-- Copy a YouTube link while 'Watch clipboard' is on and it queues itself
-- History window showing everything downloaded and where it was saved
-- Warns before starting if a queue looks likely to fill the drive
-- Double-click a queue row to open the folder its files went to
-- A summary at the end of a queue when something didn't work, with the
-  option to retry there and then
-- Unexpected errors now show a plain explanation and are written to the
-  log, instead of a technical error box
+- Clip a section: download just part of a video by entering a start and
+  end time, instead of the whole thing
+- Remove sponsors: strips sponsor readings, self-promotion, intros and
+  outros using the SponsorBlock database
+- Pause and resume a download without losing progress
+- ClipStash flashes in the taskbar when a queue finishes and you're
+  working in another window
+- Portable mode: put an empty file named portable.txt next to
+  ClipStash.exe and all settings, logs and history are kept in a Data
+  folder beside it, so it can travel on a USB stick

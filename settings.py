@@ -51,6 +51,10 @@ DEFAULTS: dict[str, Any] = {
     "concurrent_fragments": 4,
     "window_geometry": "",
     "watch_clipboard": False,
+    # Clip start/end are deliberately absent: a time range belongs to one
+    # specific video, and silently reapplying last week's to a new download
+    # would quietly truncate it.
+    "sponsorblock": False,
 }
 
 

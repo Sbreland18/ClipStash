@@ -125,6 +125,10 @@ Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cr
 ;     uncomment this one if you built with --onefile.
 ; Source: "dist\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
+; Instructions for portable mode. Not installed if absent, and never
+; overwritten, so a user who has already renamed it keeps their choice.
+Source: "portable.txt.example"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist skipifsourcedoesntexist
+
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; Tasks: desktopicon

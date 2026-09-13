@@ -53,6 +53,45 @@ RUNTIME_DIRNAME = "runtime"
 # Locations
 # --------------------------------------------------------------------------- #
 
+PORTABLE_MARKERS = ("portable.txt", "ClipStash.portable")
+
+
+def _executable_dir() -> Path:
+    """The folder ClipStash was launched from."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def portable_dir() -> Path | None:
+    """
+    The data folder to use in portable mode, or None for a normal install.
+
+    Portable mode is switched on by dropping an empty file named portable.txt
+    next to the executable. Everything ClipStash stores - settings, logs,
+    history, downloaded yt-dlp updates - then lives in a Data folder beside it
+    rather than under the user's profile, so the whole thing travels on a USB
+    stick between machines.
+
+    The folder is tested for writability before being accepted: a stick that's
+    write-protected, or an install under Program Files where a standard user
+    can't write, would otherwise fail silently on every save.
+    """
+    base = _executable_dir()
+    if not any((base / marker).is_file() for marker in PORTABLE_MARKERS):
+        return None
+
+    data = base / "Data"
+    try:
+        data.mkdir(parents=True, exist_ok=True)
+        probe = data / ".writetest"
+        probe.write_text("", encoding="ascii")
+        probe.unlink()
+        return data
+    except Exception:
+        return None
+
+
 def _app_dir_base() -> Path:
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
@@ -64,7 +103,16 @@ def _app_dir_base() -> Path:
 
 
 def user_data_dir() -> Path:
-    """Per-user writable directory, following each platform's convention."""
+    """
+    Where ClipStash keeps everything for this user.
+
+    Portable mode wins when active. Because settings, logs and history all
+    derive their locations from this one function, that single check moves the
+    whole lot without any of them needing to know.
+    """
+    portable = portable_dir()
+    if portable is not None:
+        return portable
     return _app_dir_base() / APP_DIRNAME
 
 

@@ -252,6 +252,22 @@ HELP = {
         "Downloads often fail for temporary reasons and succeed on a second "
         "attempt. With 'Skip already downloaded' switched on, videos that worked "
         "the first time are passed over, so only the failures are retried.",
+    "clip":
+        "Download only part of a video instead of the whole thing.\n\n"
+        "Leave both boxes empty for the full video. Fill in one or both to take "
+        "a section: leaving 'From' empty starts at the beginning, leaving 'To' "
+        "empty runs to the end.\n\n"
+        "Times can be written as seconds (90), minutes and seconds (1:30), or "
+        "hours, minutes and seconds (1:02:03).\n\n"
+        "This applies to single videos, not playlists, and the times aren't kept "
+        "between downloads.",
+    "sponsorblock":
+        "Automatically cut out sponsor readings, self-promotion, intros and "
+        "outros.\n\n"
+        "Uses the community-maintained SponsorBlock database, which means it "
+        "relies on someone having already marked up that video. Well-known "
+        "videos are usually covered; obscure ones often aren't.\n\n"
+        "Requires ffmpeg, and makes downloads a little slower.",
     "watch":
         "Watch the clipboard for links and add them to the queue on their own.\n\n"
         "Leave this on while browsing YouTube: every time you copy a video "
@@ -269,6 +285,11 @@ HELP = {
     "download":
         "Start downloading.\n\n"
         "The progress bars and the log underneath show what's happening.",
+    "pause":
+        "Pause the download without losing what's been fetched so far.\n\n"
+        "Useful if you need the internet back for a video call. Press Resume and "
+        "it picks up from where it stopped rather than starting the file again.\n\n"
+        "Unlike Cancel, the queue stays where it is.",
     "cancel":
         "Stop the download that's running.\n\n"
         "Partly finished files are kept, and downloading again picks up from "
@@ -348,6 +369,52 @@ def free_space(folder: Path) -> int:
             break
         probe = probe.parent
     return -1
+
+
+def parse_timestamp(text: str) -> float | None:
+    """
+    Turn "90", "1:30" or "1:02:03" into seconds.
+
+    Returns None for empty input, and raises ValueError for anything that isn't
+    a time, so the caller can tell "not set" apart from "typed wrong" - a silent
+    fallback to zero would quietly clip from the start of the video instead.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    parts = text.split(":")
+    if len(parts) > 3:
+        raise ValueError("Use seconds, mm:ss, or hh:mm:ss.")
+
+    total = 0.0
+    for part in parts:
+        part = part.strip()
+        if not part:
+            raise ValueError("Use seconds, mm:ss, or hh:mm:ss.")
+        try:
+            value = float(part)
+        except ValueError:
+            raise ValueError(f"'{text}' isn't a time. Use seconds, mm:ss, or hh:mm:ss.")
+        if value < 0:
+            raise ValueError("Times can't be negative.")
+        total = total * 60 + value
+    return total
+
+
+def format_timestamp(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+# Segments SponsorBlock can strip. Sponsor and self-promotion are the ones
+# nearly everyone wants gone; intros and outros are included because they're
+# the usual complaint about classroom clips.
+SPONSORBLOCK_CATEGORIES = [
+    "sponsor", "selfpromo", "interaction", "intro", "outro", "preview", "music_offtopic",
+]
 
 
 def apply_cookie_opts(opts: dict[str, Any], cfg: "JobConfig") -> None:
@@ -563,6 +630,9 @@ class JobConfig:
     restrict_filenames: bool = False
     cookies_browser: str = "None"
     cookies_file: str = ""
+    clip_start: float | None = None
+    clip_end: float | None = None
+    sponsorblock: bool = False
     concurrent_fragments: int = 4
     extra_args: dict[str, Any] = field(default_factory=dict)
 
@@ -709,11 +779,18 @@ class QueueLogger:
 
 
 class Downloader(threading.Thread):
-    def __init__(self, config: JobConfig, out: queue.Queue, cancel: threading.Event):
+    def __init__(self, config: JobConfig, out: queue.Queue, cancel: threading.Event,
+                 pause: threading.Event | None = None):
         super().__init__(daemon=True)
         self.config = config
         self.out = out
         self.cancel = cancel
+        # Set means "keep going". Pausing clears it, and the progress hook then
+        # blocks on it, which stops the transfer without tearing the connection
+        # down - so resuming carries on rather than starting the file again.
+        self.pause = pause if pause is not None else threading.Event()
+        if pause is None:
+            self.pause.set()
         self.completed = 0
         self.failed = 0
         self.total = 1
@@ -787,6 +864,39 @@ class Downloader(threading.Thread):
 
         apply_cookie_opts(opts, cfg)
 
+        if cfg.clip_start is not None or cfg.clip_end is not None:
+            start = cfg.clip_start or 0.0
+            end = cfg.clip_end if cfg.clip_end is not None else float("inf")
+            try:
+                from yt_dlp.utils import download_range_func
+                opts["download_ranges"] = download_range_func(None, [(start, end)])
+                # Cut on real keyframes so the clip starts where asked rather
+                # than at the nearest preceding keyframe, which can be seconds
+                # early. Costs a re-encode, which is why it isn't the default.
+                opts["force_keyframes_at_cuts"] = True
+            except Exception:
+                self.out.put(("log", "WARNING: This yt-dlp build can't clip sections; "
+                                     "downloading the whole video instead."))
+                clipping = False
+            else:
+                clipping = True
+        else:
+            clipping = False
+
+        if cfg.sponsorblock:
+            # Order matters: SponsorBlock marks the segments, ModifyChapters is
+            # what actually cuts them out. Listed the other way round the
+            # remover runs before anything has been marked and does nothing.
+            postprocessors.insert(0, {
+                "key": "SponsorBlock",
+                "categories": SPONSORBLOCK_CATEGORIES,
+                "when": "after_filter",
+            })
+            postprocessors.insert(1, {
+                "key": "ModifyChapters",
+                "remove_sponsor_segments": SPONSORBLOCK_CATEGORIES,
+            })
+
         ffmpeg_dir = find_ffmpeg()
         if ffmpeg_dir:
             opts["ffmpeg_location"] = ffmpeg_dir
@@ -795,7 +905,10 @@ class Downloader(threading.Thread):
             opts["merge_output_format"] = merge_format
         if cfg.playlist_items.strip():
             opts["playlist_items"] = cfg.playlist_items.strip()
-        if cfg.use_archive:
+        # The archive records a video id, not a time range, so a clipped download
+        # would mark the whole video as fetched and block any later attempt to
+        # get the rest of it. Skipped entirely while clipping.
+        if cfg.use_archive and not clipping:
             archive = cfg.output_dir / ".clipstash-archive.txt"
             opts["download_archive"] = str(archive)
         if cfg.write_subtitles:
@@ -818,6 +931,13 @@ class Downloader(threading.Thread):
     def _check_cancel(self) -> None:
         if self.cancel.is_set():
             raise DownloadCancelled("Cancelled by user")
+
+        # Wait here while paused, but in short slices so Cancel still works
+        # while paused rather than being ignored until someone resumes.
+        while not self.pause.is_set():
+            if self.cancel.is_set():
+                raise DownloadCancelled("Cancelled by user")
+            self.pause.wait(0.2)
 
     def _progress_hook(self, d: dict[str, Any]) -> None:
         self._check_cancel()
@@ -971,6 +1091,8 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.metadata.start()
         self.history_window: tk.Toplevel | None = None
         self._last_clipboard = ""
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         self.last_config: JobConfig | None = None
         self.update_window: tk.Toplevel | None = None
         self.app_update_window: tk.Toplevel | None = None
@@ -1070,6 +1192,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.var_frags = tk.IntVar(value=saved("concurrent_fragments", 4))
         self.var_queue = tk.StringVar(value="Queue is empty.")
         self.var_watch = tk.BooleanVar(value=saved("watch_clipboard", False))
+        self.var_clip_start = tk.StringVar()
+        self.var_clip_end = tk.StringVar()
+        self.var_sponsor = tk.BooleanVar(value=saved("sponsorblock", False))
         self.var_version = tk.StringVar(value="")
         self.var_appversion = tk.StringVar(
             value=f"ClipStash {appversion.__version__}" if appversion else "ClipStash")
@@ -1176,8 +1301,22 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self._tip("cookiefile", cookie_label, cookie_entry)
         self._tip("choose", cookie_btn)
 
+        clip_label = ttk.Label(opt, text="Clip section")
+        clip_label.grid(row=3, column=0, sticky="w", **pad)
+        clip_row = ttk.Frame(opt)
+        clip_row.grid(row=3, column=1, columnspan=3, sticky="w", **pad)
+        ttk.Label(clip_row, text="From").pack(side="left")
+        clip_start = ttk.Entry(clip_row, textvariable=self.var_clip_start, width=10)
+        clip_start.pack(side="left", padx=(6, 12))
+        ttk.Label(clip_row, text="To").pack(side="left")
+        clip_end = ttk.Entry(clip_row, textvariable=self.var_clip_end, width=10)
+        clip_end.pack(side="left", padx=(6, 12))
+        ttk.Label(clip_row, text="e.g. 1:30   (leave empty for the whole video)",
+                  style="Muted.TLabel").pack(side="left")
+        self._tip("clip", clip_label, clip_start, clip_end)
+
         checks = ttk.Frame(opt)
-        checks.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        checks.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
 
         row_one = [
             ("Folder per playlist", self.var_folder, "folder"),
@@ -1199,6 +1338,10 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             box = ttk.Checkbutton(checks, text=label, variable=var)
             box.grid(row=1, column=col, sticky="w", padx=(0, 16))
             self._tip(key, box)
+
+        sponsor_box = ttk.Checkbutton(checks, text="Remove sponsors", variable=self.var_sponsor)
+        sponsor_box.grid(row=1, column=4, sticky="w", padx=(0, 16))
+        self._tip("sponsorblock", sponsor_box)
 
         sublang_label = ttk.Label(checks, text="Subtitle languages")
         sublang_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
@@ -1263,8 +1406,12 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.btn_start = ttk.Button(act, text="Download", command=self._start,
                                     style="Accent.TButton")
         self.btn_start.pack(side="left")
+        self.btn_pause = ttk.Button(act, text="Pause", command=self._toggle_pause,
+                                    state="disabled")
+        self.btn_pause.pack(side="left", padx=8)
         self.btn_cancel = ttk.Button(act, text="Cancel", command=self._cancel, state="disabled")
-        self.btn_cancel.pack(side="left", padx=8)
+        self.btn_cancel.pack(side="left", padx=(0, 8))
+        self._tip("pause", self.btn_pause)
         open_btn = ttk.Button(act, text="Open folder", command=self._open_dir)
         open_btn.pack(side="left")
         clear_btn = ttk.Button(act, text="Clear log", command=self._clear_log)
@@ -1391,6 +1538,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             "concurrent_fragments": int(self.var_frags.get()),
             "window_geometry": self.geometry(),
             "watch_clipboard": bool(self.var_watch.get()),
+            "sponsorblock": bool(self.var_sponsor.get()),
         }
 
     def _save_settings(self) -> None:
@@ -1480,6 +1628,69 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             if item and item not in cleaned:
                 cleaned.append(item)
         return cleaned
+
+    # -- finish notification -------------------------------------------------- #
+
+    def _has_focus(self) -> bool:
+        try:
+            return bool(self.focus_displayof())
+        except Exception:
+            return True   # assume focused, so we stay quiet rather than nag
+
+    def _notify_finished(self, summary: str) -> None:
+        """
+        Get attention when a queue ends and nobody's watching.
+
+        Deliberately silent if ClipStash is the window in front: someone looking
+        straight at the finished queue doesn't need their taskbar flashed at
+        them. No third-party toast library either - flashing the taskbar button
+        is built into Windows, needs no dependency, and is the conventional way
+        a background app says it's done.
+        """
+        if self._has_focus():
+            return
+
+        try:
+            self.bell()
+        except Exception:
+            pass
+
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class FLASHWINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.UINT),
+                        ("hwnd", wintypes.HWND),
+                        ("dwFlags", wintypes.DWORD),
+                        ("uCount", wintypes.UINT),
+                        ("dwTimeout", wintypes.DWORD),
+                    ]
+
+                FLASHW_ALL = 0x00000003
+                FLASHW_TIMERNOFG = 0x0000000C   # flash until the window is opened
+
+                info = FLASHWINFO(
+                    cbSize=ctypes.sizeof(FLASHWINFO),
+                    hwnd=wintypes.HWND(int(self.wm_frame(), 16)),
+                    dwFlags=FLASHW_ALL | FLASHW_TIMERNOFG,
+                    uCount=5,
+                    dwTimeout=0,
+                )
+                ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+                return
+            except Exception:
+                pass
+
+        # Elsewhere, ask the window manager to mark the window as wanting
+        # attention. Most Linux and macOS desktops bounce or highlight it.
+        try:
+            self.attributes("-topmost", True)
+            self.after(400, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
 
     # -- history ------------------------------------------------------------- #
 
@@ -1803,6 +2014,8 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                 "to the queue.")
             return
 
+        if not self._validate_clip():
+            return
         if not self._check_disk_space():
             return
 
@@ -1813,8 +2026,56 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.processing = True
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
+        self.btn_pause.configure(state="normal", text="Pause", style="TButton")
         self.btn_retry.configure(state="disabled")
         self._process_next()
+
+    def _clip_range(self) -> tuple:
+        """Parsed clip times, or (None, None). Raises nothing; validated earlier."""
+        try:
+            return (parse_timestamp(self.var_clip_start.get()),
+                    parse_timestamp(self.var_clip_end.get()))
+        except ValueError:
+            return (None, None)
+
+    def _validate_clip(self) -> bool:
+        """Check the clip boxes before starting, and explain anything wrong."""
+        try:
+            start = parse_timestamp(self.var_clip_start.get())
+            end = parse_timestamp(self.var_clip_end.get())
+        except ValueError as exc:
+            messagebox.showwarning("Check the clip times", str(exc))
+            return False
+
+        if start is not None and end is not None and end <= start:
+            messagebox.showwarning(
+                "Check the clip times",
+                f"The end time ({format_timestamp(end)}) needs to be after the "
+                f"start time ({format_timestamp(start)}).")
+            return False
+
+        if start is None and end is None:
+            return True
+
+        if find_ffmpeg() is None:
+            messagebox.showwarning(
+                "ffmpeg needed",
+                "Clipping a section needs ffmpeg, which wasn't found.\n\n"
+                "Clear the clip boxes to download whole videos, or install ffmpeg.")
+            return False
+
+        # Clipping a playlist would apply the same window to every video in it,
+        # which is almost never what someone means.
+        playlists = [i for i in self.items if i.status == "pending" and i.is_playlist]
+        if playlists:
+            return messagebox.askyesno(
+                "Clipping a playlist",
+                f"{len(playlists)} item(s) in the queue are playlists, and the same "
+                "time range would be applied to every video in them.\n\n"
+                "Carry on anyway?",
+                icon="warning")
+
+        return True
 
     def _check_disk_space(self) -> bool:
         """
@@ -1867,6 +2128,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             self.current_index = None
             self.btn_start.configure(state="normal")
             self.btn_cancel.configure(state="disabled")
+            self._reset_pause_button()
             self.bar_item["value"] = 0
             self.bar_overall["value"] = 0
 
@@ -1876,6 +2138,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                 f"Queue finished. {finished} completed"
                 + (f", {problems} with problems." if problems else "."))
             self._append(f"Queue finished - {finished} completed, {problems} with problems.")
+            self._notify_finished(
+                f"{finished} completed"
+                + (f", {problems} with problems" if problems else ""))
             if applog:
                 applog.write(f"Queue finished: {finished} ok, {problems} problems")
             self._refresh_queue()
@@ -1923,13 +2188,17 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             cookies_browser=self.var_browser.get(),
             cookies_file=self.var_cookiefile.get().strip(),
             concurrent_fragments=int(self.var_frags.get()),
+            clip_start=self._clip_range()[0],
+            clip_end=self._clip_range()[1],
+            sponsorblock=bool(self.var_sponsor.get()),
         )
         self._start_job(config)
 
     def _start_job(self, config: JobConfig) -> None:
         self.last_config = config
         self.cancel_event = threading.Event()
-        self.worker = Downloader(config, self.queue, self.cancel_event)
+        self.pause_event.set()
+        self.worker = Downloader(config, self.queue, self.cancel_event, self.pause_event)
         self.worker.start()
 
         self.btn_start.configure(state="disabled")
@@ -2009,7 +2278,28 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self._append("Retrying without cookies…")
         self._start_job(retry_config)
 
+    def _toggle_pause(self) -> None:
+        if not self.processing:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.btn_pause.configure(text="Resume", style="Accent.TButton")
+            self.var_status.set("Paused.")
+            self._append("Paused - press Resume to carry on.")
+        else:
+            self.pause_event.set()
+            self.btn_pause.configure(text="Pause", style="TButton")
+            self.var_status.set("Resuming...")
+            self._append("Resumed.")
+
+    def _reset_pause_button(self) -> None:
+        self.pause_event.set()
+        self.btn_pause.configure(text="Pause", style="TButton", state="disabled")
+
     def _cancel(self) -> None:
+        # Release any pause first: a paused worker is sitting in a wait loop and
+        # would otherwise not notice the cancel until someone resumed.
+        self.pause_event.set()
         self.cancel_event.set()
         self.var_status.set("Cancelling…")
         self.btn_cancel.configure(state="disabled")
@@ -2020,6 +2310,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         if not self.processing:
             self.btn_start.configure(state="normal")
             self.btn_cancel.configure(state="disabled")
+            self._reset_pause_button()
             self._refresh_queue()
 
     def _mark_current(self, status: str, note: str = "") -> None:
