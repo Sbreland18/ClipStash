@@ -219,6 +219,9 @@ HELP = {
         "'en' means English. Separate several with commas, like:  en,es,fr",
     "queue":
         "Links waiting to be downloaded, worked through one at a time.\n\n"
+        "Titles and channel names are filled in shortly after a link is added, "
+        "so you can check you queued the right thing. Playlists also show how "
+        "many videos they contain.\n\n"
         "Paste several links and leave it running. If one fails, the rest carry "
         "on regardless.",
     "addqueue":
@@ -446,16 +449,28 @@ QUEUE_STATUS = {
 
 @dataclass
 class QueueItem:
-    """One URL waiting its turn."""
+    """One URL waiting its turn, plus whatever we've learned about it."""
     url: str
     status: str = "pending"
     note: str = ""
     title: str = ""
+    channel: str = ""
+    is_playlist: bool = False
+    count: int = 0
+    looked_up: bool = False
     failed_ids: list = field(default_factory=list)
+    cookie_opts: dict = field(default_factory=dict)
 
     @property
     def label(self) -> str:
-        return self.title or self.url
+        """What to show in the Link column."""
+        if not self.title:
+            return self.url
+        if self.is_playlist and self.count:
+            return f"{self.title}  ({self.count} videos)"
+        if self.is_playlist:
+            return f"{self.title}  (playlist)"
+        return self.title
 
     @property
     def retryable(self) -> bool:
@@ -485,6 +500,86 @@ class JobConfig:
 # --------------------------------------------------------------------------- #
 # Downloader (runs off the UI thread)
 # --------------------------------------------------------------------------- #
+
+class MetadataFetcher(threading.Thread):
+    """
+    Looks up titles and channel names for queued links.
+
+    Runs as a single long-lived worker rather than a thread per item. That is
+    deliberate: firing off ten simultaneous lookups when someone pastes ten
+    links is a good way to attract rate limiting, and the results are only
+    cosmetic, so there is nothing to gain from doing them at once.
+
+    Failures are silent by design. Not knowing a video's title is a small
+    cosmetic loss; it must never produce an error dialog or stop the link from
+    being downloaded perfectly well a moment later.
+    """
+
+    def __init__(self, out: queue.Queue):
+        super().__init__(daemon=True)
+        self.out = out
+        self.work: queue.Queue = queue.Queue()
+        # Not named _stop: threading.Thread already has a private _stop()
+        # method that Python calls during teardown, and shadowing it with an
+        # Event breaks is_alive() and thread cleanup.
+        self._stop_event = threading.Event()
+
+    def request(self, url: str, cookie_opts: dict) -> None:
+        self.work.put((url, cookie_opts))
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self.work.put((None, None))
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                url, cookie_opts = self.work.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if url is None or self._stop_event.is_set():
+                return
+            try:
+                self.out.put(("meta_result", self._lookup(url, cookie_opts or {})))
+            except Exception:
+                pass
+
+    def _lookup(self, url: str, cookie_opts: dict) -> dict:
+        result = {"url": url, "title": "", "channel": "", "is_playlist": False, "count": 0}
+        if yt_dlp is None:
+            return result
+
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            # Flatten playlist members so a 200-video playlist doesn't trigger
+            # 200 separate extractions just to display its name.
+            "extract_flat": "in_playlist",
+            "ignoreerrors": True,
+        }
+        opts.update(cookie_opts)
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception:
+            return result
+        if not info:
+            return result
+
+        result["title"] = (info.get("title") or "").strip()
+        result["channel"] = (
+            info.get("channel") or info.get("uploader") or info.get("playlist_uploader") or ""
+        ).strip()
+
+        if info.get("_type") == "playlist":
+            result["is_playlist"] = True
+            entries = [e for e in (info.get("entries") or []) if e]
+            result["count"] = info.get("playlist_count") or len(entries)
+
+        return result
+
 
 class QueueLogger:
     """Routes yt-dlp's internal messages into the UI queue."""
@@ -777,6 +872,8 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.items: list[QueueItem] = []
         self.current_index: int | None = None
         self.processing = False
+        self.metadata = MetadataFetcher(self.queue)
+        self.metadata.start()
         self.last_config: JobConfig | None = None
         self.update_window: tk.Toplevel | None = None
         self.app_update_window: tk.Toplevel | None = None
@@ -1014,11 +1111,13 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         qframe.columnconfigure(0, weight=1)
         qframe.rowconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(qframe, columns=("status",), height=5,
+        self.tree = ttk.Treeview(qframe, columns=("channel", "status"), height=5,
                                  selectmode="extended")
-        self.tree.heading("#0", text="Link", anchor="w")
+        self.tree.heading("#0", text="Video / Playlist", anchor="w")
+        self.tree.heading("channel", text="Channel", anchor="w")
         self.tree.heading("status", text="Status", anchor="w")
-        self.tree.column("#0", anchor="w", stretch=True, minwidth=220)
+        self.tree.column("#0", anchor="w", stretch=True, minwidth=240)
+        self.tree.column("channel", anchor="w", width=170, stretch=False)
         self.tree.column("status", anchor="w", width=170, stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self._tip("queue", self.tree)
@@ -1201,6 +1300,10 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                 return
             self.cancel_event.set()
         self._save_settings()
+        try:
+            self.metadata.stop()
+        except Exception:
+            pass
         if applog:
             applog.write("ClipStash closed")
         self.destroy()
@@ -1269,6 +1372,30 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
 
     # -- queue -------------------------------------------------------------- #
 
+    def _cookie_snapshot(self) -> dict:
+        """
+        Capture cookie settings on the main thread for the lookup worker.
+
+        Tk variables can only be read from the thread that owns the widgets, so
+        the values are taken here and handed over as a plain dict rather than
+        read inside the worker.
+        """
+        config = JobConfig(url="", output_dir=Path("."),
+                           cookies_browser=self.var_browser.get(),
+                           cookies_file=self.var_cookiefile.get().strip())
+        opts: dict = {}
+        apply_cookie_opts(opts, config)
+        return opts
+
+    def _request_metadata(self, item: QueueItem) -> None:
+        if yt_dlp is None or item.looked_up:
+            return
+        try:
+            self.metadata.request(item.url, item.cookie_opts)
+        except Exception:
+            pass
+
+
     def _enqueue_text(self, text: str) -> int:
         """Add every link found in some text. Returns how many were added."""
         added = 0
@@ -1276,7 +1403,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         for url in self._extract_urls(text):
             if url in existing:
                 continue
-            self.items.append(QueueItem(url=url))
+            item = QueueItem(url=url, cookie_opts=self._cookie_snapshot())
+            self.items.append(item)
+            self._request_metadata(item)
             existing.add(url)
             added += 1
         if added:
@@ -1293,7 +1422,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         if not found:
             # Not a recognisable link, but yt-dlp accepts more than plain URLs,
             # so it's queued as typed rather than rejected outright.
-            self.items.append(QueueItem(url=raw))
+            item = QueueItem(url=raw, cookie_opts=self._cookie_snapshot())
+            self.items.append(item)
+            self._request_metadata(item)
             self._refresh_queue()
         else:
             self._enqueue_text(raw)
@@ -1305,9 +1436,10 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.tree.delete(*self.tree.get_children())
         for index, item in enumerate(self.items):
             note = f"  -  {item.note}" if item.note else ""
+            channel = item.channel or ("" if item.looked_up else "looking up...")
             self.tree.insert(
                 "", "end", iid=str(index), text=item.label,
-                values=(QUEUE_STATUS.get(item.status, item.status) + note,),
+                values=(channel, QUEUE_STATUS.get(item.status, item.status) + note),
                 tags=(item.status,),
             )
         for iid in selected:
@@ -1365,11 +1497,17 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             for video_id in item.failed_ids:
                 url = f"https://www.youtube.com/watch?v={video_id}"
                 if url not in existing:
-                    self.items.append(QueueItem(url=url))
+                    fresh = QueueItem(url=url, cookie_opts=self._cookie_snapshot())
+                    self.items.append(fresh)
+                    self._request_metadata(fresh)
                     existing.add(url)
                     retried += 1
             if not item.failed_ids and item.url not in existing:
-                self.items.append(QueueItem(url=item.url))
+                fresh = QueueItem(url=item.url, title=item.title, channel=item.channel,
+                                  is_playlist=item.is_playlist, count=item.count,
+                                  looked_up=item.looked_up,
+                                  cookie_opts=self._cookie_snapshot())
+                self.items.append(fresh)
                 existing.add(item.url)
                 retried += 1
 
@@ -1655,6 +1793,21 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
 
                 if kind == "log":
                     self._append(payload)
+
+                elif kind == "meta_result":
+                    # Matched by URL rather than position: the list may have been
+                    # reordered or had rows removed while the lookup was running.
+                    for item in self.items:
+                        if item.url != payload["url"]:
+                            continue
+                        item.looked_up = True
+                        if payload["title"]:
+                            item.title = payload["title"]
+                            item.channel = payload["channel"]
+                            item.is_playlist = payload["is_playlist"]
+                            item.count = payload["count"]
+                        break
+                    self._refresh_queue()
 
                 elif kind == "meta":
                     label = "Playlist" if payload["playlist"] else "Video"
