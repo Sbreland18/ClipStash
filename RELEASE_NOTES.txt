@@ -1,12 +1,13 @@
-Version 1.3.0
+Version 1.4.0
 
-- Clip a section: download just part of a video by entering a start and
-  end time, instead of the whole thing
-- Remove sponsors: strips sponsor readings, self-promotion, intros and
-  outros using the SponsorBlock database
-- Pause and resume a download without losing progress
-- ClipStash flashes in the taskbar when a queue finishes and you're
-  working in another window
-- Portable mode: put an empty file named portable.txt next to
-  ClipStash.exe and all settings, logs and history are kept in a Data
-  folder beside it, so it can travel on a USB stick
+- Subtitles / transcript only: a new quality option that fetches just the
+  captions, with no video at all. A transcript is a few kilobytes instead
+  of a few hundred megabytes
+- Split at chapters: turns a long video with chapter markers into one
+  file per chapter
+- Warns when you queue something you have downloaded before, and says
+  when you got it
+- Checks about once a week for a newer yt-dlp, so you hear about a fix
+  before downloads start failing rather than after
+- Start at: hold a queue until a set time, for running large batches
+  outside busy hours

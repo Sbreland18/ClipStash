@@ -34,6 +34,7 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
@@ -117,7 +118,12 @@ QUALITY_PRESETS = [
     "360p or below",
     "Audio only — MP3",
     "Audio only — original (m4a/opus)",
+    "Subtitles / transcript only",
 ]
+
+# A preset rather than a checkbox, because it is a different kind of
+# download rather than a variation on one: nothing but text comes back.
+SUBTITLES_ONLY = "Subtitles / transcript only"
 
 BROWSERS = ["None", "chrome", "firefox", "edge", "brave", "safari", "chromium", "opera", "vivaldi"]
 
@@ -252,6 +258,28 @@ HELP = {
         "Downloads often fail for temporary reasons and succeed on a second "
         "attempt. With 'Skip already downloaded' switched on, videos that worked "
         "the first time are passed over, so only the failures are retried.",
+    "chapters":
+        "Split the video into separate files at its chapter markers.\n\n"
+        "A long lecture with chapters becomes one file per topic, instead of a "
+        "single large file you have to scrub through.\n\n"
+        "Only works on videos that actually have chapters; those without are "
+        "downloaded whole as usual. Requires ffmpeg.",
+    "dupes":
+        "Check new links against your download history and say if you've "
+        "already fetched them.\n\n"
+        "You're asked once before a queue starts, not once per link.",
+    "autocheck":
+        "Look for a newer yt-dlp about once a week.\n\n"
+        "yt-dlp is the part that talks to YouTube, and YouTube changes often "
+        "enough to break it every few weeks. A quiet weekly check means you "
+        "hear about a fix before downloads start failing, not after.\n\n"
+        "Nothing is installed automatically - it only tells you.",
+    "schedule":
+        "Wait until a set time before starting the queue.\n\n"
+        "Useful for leaving a large batch to run outside busy hours, so it "
+        "isn't competing with everyone else for the connection.\n\n"
+        "Use the 24-hour clock, like 18:00 for 6pm. A time that has already "
+        "passed today means tomorrow. Press Cancel to call it off.",
     "clip":
         "Download only part of a video instead of the whole thing.\n\n"
         "Leave both boxes empty for the full video. Fill in one or both to take "
@@ -595,6 +623,7 @@ class QueueItem:
     looked_up: bool = False
     duration: int = 0          # seconds, used to estimate download size
     saved_dir: str = ""        # where its files actually landed
+    duplicate_of: str = ""     # when this link was last downloaded, if it was
     failed_ids: list = field(default_factory=list)
     cookie_opts: dict = field(default_factory=dict)
 
@@ -633,6 +662,7 @@ class JobConfig:
     clip_start: float | None = None
     clip_end: float | None = None
     sponsorblock: bool = False
+    split_chapters: bool = False
     concurrent_fragments: int = 4
     extra_args: dict[str, Any] = field(default_factory=dict)
 
@@ -803,6 +833,10 @@ class Downloader(threading.Thread):
         postprocessors: list[dict] = []
         merge_format: str | None = "mp4"
 
+        if q == SUBTITLES_ONLY:
+            # No media stream at all. The caller sets skip_download, so this
+            # format string is never used; "best" is a harmless placeholder.
+            return "best", postprocessors, None
         if q == "Audio only — MP3":
             postprocessors.append(
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
@@ -911,14 +945,34 @@ class Downloader(threading.Thread):
         if cfg.use_archive and not clipping:
             archive = cfg.output_dir / ".clipstash-archive.txt"
             opts["download_archive"] = str(archive)
-        if cfg.write_subtitles:
+        subtitles_only = cfg.quality == SUBTITLES_ONLY
+        languages = [s.strip() for s in cfg.subtitle_langs.split(",") if s.strip()] or ["en"]
+
+        if subtitles_only:
+            opts["skip_download"] = True
+            opts["writesubtitles"] = True
+            # Automatic captions matter more here than anywhere else: most
+            # lecture and classroom material has no hand-written subtitles, and
+            # without this the download would succeed and produce nothing.
+            opts["writeautomaticsub"] = True
+            opts["subtitleslangs"] = languages
+            # SRT opens in anything; the VTT files YouTube serves do not.
+            if find_ffmpeg():
+                postprocessors.append({"key": "FFmpegSubtitlesConvertor", "format": "srt"})
+            opts.pop("merge_output_format", None)
+        elif cfg.write_subtitles:
             opts["writesubtitles"] = True
             opts["writeautomaticsub"] = True
-            opts["subtitleslangs"] = [s.strip() for s in cfg.subtitle_langs.split(",") if s.strip()]
+            opts["subtitleslangs"] = languages
             postprocessors.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
-        if cfg.embed_metadata:
+
+        if cfg.split_chapters and not subtitles_only:
+            # Runs after any sponsor segments are cut, so split points line up
+            # with the finished file rather than the original.
+            postprocessors.append({"key": "FFmpegSplitChapters", "force_keyframes": False})
+        if cfg.embed_metadata and not subtitles_only:
             postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True})
-        if cfg.embed_thumbnail:
+        if cfg.embed_thumbnail and not subtitles_only:
             opts["writethumbnail"] = True
             postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
         if postprocessors:
@@ -1093,6 +1147,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self._last_clipboard = ""
         self.pause_event = threading.Event()
         self.pause_event.set()
+        self.scheduled_for = None
         self.last_config: JobConfig | None = None
         self.update_window: tk.Toplevel | None = None
         self.app_update_window: tk.Toplevel | None = None
@@ -1105,6 +1160,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         # Let the window finish drawing before touching the network, so a slow
         # or blocked connection can't delay the app appearing.
         self.after(2500, self._start_background_check)
+        self.after(4000, self._maybe_check_ytdlp)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         if self.var_watch.get():
@@ -1195,6 +1251,11 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.var_clip_start = tk.StringVar()
         self.var_clip_end = tk.StringVar()
         self.var_sponsor = tk.BooleanVar(value=saved("sponsorblock", False))
+        self.var_chapters = tk.BooleanVar(value=saved("split_chapters", False))
+        self.var_dupes = tk.BooleanVar(value=saved("warn_duplicates", True))
+        self.var_autocheck = tk.BooleanVar(value=saved("auto_check_ytdlp", True))
+        self.var_schedule = tk.BooleanVar(value=saved("schedule_enabled", False))
+        self.var_schedule_time = tk.StringVar(value=saved("schedule_time", "18:00"))
         self.var_version = tk.StringVar(value="")
         self.var_appversion = tk.StringVar(
             value=f"ClipStash {appversion.__version__}" if appversion else "ClipStash")
@@ -1311,9 +1372,17 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         ttk.Label(clip_row, text="To").pack(side="left")
         clip_end = ttk.Entry(clip_row, textvariable=self.var_clip_end, width=10)
         clip_end.pack(side="left", padx=(6, 12))
-        ttk.Label(clip_row, text="e.g. 1:30   (leave empty for the whole video)",
-                  style="Muted.TLabel").pack(side="left")
+        ttk.Label(clip_row, text="e.g. 1:30", style="Muted.TLabel").pack(side="left")
         self._tip("clip", clip_label, clip_start, clip_end)
+
+        ttk.Separator(clip_row, orient="vertical").pack(side="left", fill="y", padx=14)
+        schedule_box = ttk.Checkbutton(clip_row, text="Start at",
+                                       variable=self.var_schedule)
+        schedule_box.pack(side="left")
+        schedule_entry = ttk.Entry(clip_row, textvariable=self.var_schedule_time, width=7)
+        schedule_entry.pack(side="left", padx=(6, 6))
+        ttk.Label(clip_row, text="24-hour clock", style="Muted.TLabel").pack(side="left")
+        self._tip("schedule", schedule_box, schedule_entry)
 
         checks = ttk.Frame(opt)
         checks.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 0))
@@ -1342,6 +1411,20 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         sponsor_box = ttk.Checkbutton(checks, text="Remove sponsors", variable=self.var_sponsor)
         sponsor_box.grid(row=1, column=4, sticky="w", padx=(0, 16))
         self._tip("sponsorblock", sponsor_box)
+
+        chapters_box = ttk.Checkbutton(checks, text="Split at chapters",
+                                       variable=self.var_chapters)
+        chapters_box.grid(row=1, column=5, sticky="w", padx=(0, 16))
+        self._tip("chapters", chapters_box)
+
+        dupes_box = ttk.Checkbutton(checks, text="Warn about repeats", variable=self.var_dupes)
+        dupes_box.grid(row=0, column=4, sticky="w", padx=(0, 16))
+        self._tip("dupes", dupes_box)
+
+        autocheck_box = ttk.Checkbutton(checks, text="Weekly yt-dlp check",
+                                        variable=self.var_autocheck)
+        autocheck_box.grid(row=0, column=5, sticky="w", padx=(0, 16))
+        self._tip("autocheck", autocheck_box)
 
         sublang_label = ttk.Label(checks, text="Subtitle languages")
         sublang_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
@@ -1484,6 +1567,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
 
         update_btn = ttk.Button(footer, text="Update yt-dlp\u2026", command=self._open_updater)
         update_btn.pack(side="right")
+        self.btn_ytdlp = update_btn
         self._tip("update", update_btn)
 
         # Only offered when a feed is configured, so builds without one don't
@@ -1539,6 +1623,12 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             "window_geometry": self.geometry(),
             "watch_clipboard": bool(self.var_watch.get()),
             "sponsorblock": bool(self.var_sponsor.get()),
+            "split_chapters": bool(self.var_chapters.get()),
+            "warn_duplicates": bool(self.var_dupes.get()),
+            "auto_check_ytdlp": bool(self.var_autocheck.get()),
+            "schedule_enabled": bool(self.var_schedule.get()),
+            "schedule_time": self.var_schedule_time.get().strip(),
+            "last_ytdlp_check": self.settings.get("last_ytdlp_check", ""),
         }
 
     def _save_settings(self) -> None:
@@ -1628,6 +1718,152 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             if item and item not in cleaned:
                 cleaned.append(item)
         return cleaned
+
+    # -- weekly yt-dlp check ---------------------------------------------------- #
+
+    def _maybe_check_ytdlp(self) -> None:
+        """
+        Look for a newer yt-dlp about once a week, quietly.
+
+        This is the update that actually matters day to day: YouTube changes
+        often enough to break downloading every few weeks, and almost nobody
+        thinks to press the update button until something has already stopped
+        working. Checking on a timer turns that into a note beforehand rather
+        than a support question afterwards.
+
+        Deliberately never a dialog. One line in the log and a relabelled
+        button; the user updates when it suits them.
+        """
+        if updater is None or not self.var_autocheck.get():
+            return
+
+        last = (self.settings or {}).get("last_ytdlp_check", "")
+        if last:
+            try:
+                if datetime.now() - datetime.fromisoformat(last) < timedelta(days=7):
+                    return
+            except ValueError:
+                pass   # unreadable date, treat as never checked
+
+        def worker() -> None:
+            try:
+                available, meta = updater.check_for_update()
+                if available:
+                    self.queue.put(("ytdlp_update", meta))
+            except Exception:
+                pass   # a silent check that fails stays silent
+            finally:
+                # Recorded whether or not it succeeded, so a machine that is
+                # permanently offline doesn't retry on every single launch.
+                self.settings["last_ytdlp_check"] = datetime.now().isoformat(timespec="seconds")
+                self._save_settings()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -- duplicates ----------------------------------------------------------- #
+
+    def _flag_duplicate(self, item: QueueItem) -> None:
+        """Note if this link has been downloaded before. Never blocks anything."""
+        if apphistory is None or not self.var_dupes.get():
+            return
+        try:
+            previous = apphistory.find_by_url(item.url)
+        except Exception:
+            return
+        if previous:
+            item.duplicate_of = previous.when_display
+
+    def _confirm_duplicates(self) -> bool:
+        """
+        Ask once, before starting, if anything queued was downloaded before.
+
+        One prompt covering the whole queue rather than one per link: someone
+        pasting twenty links they've had before should be asked once, not
+        twenty times.
+        """
+        if not self.var_dupes.get():
+            return True
+        repeats = [i for i in self.items if i.status == "pending" and i.duplicate_of]
+        if not repeats:
+            return True
+
+        listing = "\n".join(f"  {i.label[:56]}  ({i.duplicate_of})" for i in repeats[:6])
+        extra = "" if len(repeats) <= 6 else f"\n  ...and {len(repeats) - 6} more"
+        return messagebox.askyesno(
+            "Already downloaded",
+            f"{len(repeats)} of these have been downloaded before:\n\n{listing}{extra}\n\n"
+            "With 'Skip already downloaded' switched on they'll be passed over "
+            "anyway. Carry on?",
+            icon="question")
+
+    # -- scheduled start -------------------------------------------------------- #
+
+    def _parse_schedule(self) -> "datetime | None":
+        """Next occurrence of the scheduled time, or None if it isn't valid."""
+        text = self.var_schedule_time.get().strip()
+        try:
+            hours, minutes = (int(part) for part in text.split(":"))
+            if not (0 <= hours < 24 and 0 <= minutes < 60):
+                return None
+        except Exception:
+            return None
+
+        now = datetime.now()
+        target = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+        if target <= now:
+            # A time that's already gone means tomorrow, not immediately.
+            target += timedelta(days=1)
+        return target
+
+    def _begin_schedule(self) -> bool:
+        """Set the queue running later. Returns True if a wait was started."""
+        if not self.var_schedule.get():
+            return False
+
+        target = self._parse_schedule()
+        if target is None:
+            messagebox.showwarning(
+                "Check the start time",
+                f"'{self.var_schedule_time.get()}' isn't a time.\n\n"
+                "Use 24-hour clock, like 18:00 for 6pm.")
+            return False
+
+        self.scheduled_for = target
+        self.btn_start.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        when = target.strftime("%H:%M")
+        day = "today" if target.date() == datetime.now().date() else "tomorrow"
+        self._append(f"Waiting until {when} {day} to start.")
+        if applog:
+            applog.write(f"Queue scheduled for {target.isoformat(timespec='minutes')}")
+        self._tick_schedule()
+        return True
+
+    def _tick_schedule(self) -> None:
+        if self.scheduled_for is None:
+            return
+        remaining = (self.scheduled_for - datetime.now()).total_seconds()
+        if remaining <= 0:
+            self.scheduled_for = None
+            self._append("Scheduled time reached - starting.")
+            self._start(ignore_schedule=True)
+            return
+
+        hours, rem = divmod(int(remaining), 3600)
+        minutes, seconds = divmod(rem, 60)
+        countdown = f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {seconds:02d}s"
+        self.var_status.set(
+            f"Starting at {self.scheduled_for.strftime('%H:%M')} - {countdown} to go.")
+        self.after(1000, self._tick_schedule)
+
+    def _cancel_schedule(self) -> None:
+        if self.scheduled_for is None:
+            return
+        self.scheduled_for = None
+        self.var_status.set("Scheduled start cancelled.")
+        self._append("Scheduled start cancelled.")
+        self.btn_start.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
 
     # -- finish notification -------------------------------------------------- #
 
@@ -1824,6 +2060,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             if url in existing:
                 continue
             item = QueueItem(url=url, cookie_opts=self._cookie_snapshot())
+            self._flag_duplicate(item)
             self.items.append(item)
             self._request_metadata(item)
             existing.add(url)
@@ -1843,6 +2080,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             # Not a recognisable link, but yt-dlp accepts more than plain URLs,
             # so it's queued as typed rather than rejected outright.
             item = QueueItem(url=raw, cookie_opts=self._cookie_snapshot())
+            self._flag_duplicate(item)
             self.items.append(item)
             self._request_metadata(item)
             self._refresh_queue()
@@ -1856,6 +2094,8 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.tree.delete(*self.tree.get_children())
         for index, item in enumerate(self.items):
             note = f"  -  {item.note}" if item.note else ""
+            if item.status == "pending" and item.duplicate_of:
+                note = f"  -  already downloaded {item.duplicate_of}"
             channel = item.channel or ("" if item.looked_up else "looking up...")
             self.tree.insert(
                 "", "end", iid=str(index), text=item.label,
@@ -1992,7 +2232,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             level = "ERROR" if tag == ("error",) else "WARN" if tag == ("warn",) else "INFO"
             applog.write(line, level)
 
-    def _start(self) -> None:
+    def _start(self, ignore_schedule: bool = False) -> None:
         """Begin working through the queue, adding the URL box first if filled."""
         if yt_dlp is None:
             messagebox.showerror(APP_NAME, "yt-dlp is not installed.\n\npip install -U yt-dlp")
@@ -2016,7 +2256,14 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
 
         if not self._validate_clip():
             return
+        if not self._confirm_duplicates():
+            return
         if not self._check_disk_space():
+            return
+
+        # Everything has been agreed to; only now is it worth waiting.
+        if not ignore_schedule and self._begin_schedule():
+            self._save_settings()
             return
 
         # Options are saved whenever a download starts, so a crash or power cut
@@ -2191,6 +2438,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             clip_start=self._clip_range()[0],
             clip_end=self._clip_range()[1],
             sponsorblock=bool(self.var_sponsor.get()),
+            split_chapters=bool(self.var_chapters.get()),
         )
         self._start_job(config)
 
@@ -2297,6 +2545,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.btn_pause.configure(text="Pause", style="TButton", state="disabled")
 
     def _cancel(self) -> None:
+        if self.scheduled_for is not None:
+            self._cancel_schedule()
+            return
         # Release any pause first: a paused worker is sitting in a wait loop and
         # would otherwise not notice the cancel until someone resumed.
         self.pause_event.set()
@@ -2409,6 +2660,17 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                     # pressing Cancel wants everything to stop.
                     self.processing = False
                     self._finish()
+
+                elif kind == "ytdlp_update":
+                    newest = payload.get("version", "")
+                    self._append(
+                        f"A newer yt-dlp ({newest}) is available. YouTube changes often, "
+                        "so updating is worth doing if downloads start failing.")
+                    try:
+                        self.btn_ytdlp.configure(text=f"Update yt-dlp to {newest}",
+                                                 style="Accent.TButton")
+                    except Exception:
+                        pass
 
                 elif kind == "app_update_available":
                     self.pending_release = payload

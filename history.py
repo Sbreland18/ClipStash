@@ -144,6 +144,24 @@ def record(filepath: str, title: str = "", url: str = "", channel: str = "") -> 
     return entry
 
 
+def find_by_url(url: str) -> Entry | None:
+    """
+    The most recent download of this link, if there is one.
+
+    Matched on the URL as stored. Deliberately not clever about it: a link with
+    extra tracking parameters is treated as different, which risks missing a
+    duplicate but never wrongly claims something was already downloaded when it
+    wasn't. A false "you already have this" is the more annoying mistake.
+    """
+    if not url:
+        return None
+    target = url.strip()
+    for entry in load():
+        if entry.url and entry.url.strip() == target:
+            return entry
+    return None
+
+
 def clear() -> bool:
     try:
         path().unlink(missing_ok=True)

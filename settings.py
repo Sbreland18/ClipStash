@@ -55,6 +55,12 @@ DEFAULTS: dict[str, Any] = {
     # specific video, and silently reapplying last week's to a new download
     # would quietly truncate it.
     "sponsorblock": False,
+    "split_chapters": False,
+    "warn_duplicates": True,
+    "auto_check_ytdlp": True,
+    "last_ytdlp_check": "",
+    "schedule_enabled": False,
+    "schedule_time": "18:00",
 }
 
 
