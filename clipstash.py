@@ -1196,9 +1196,11 @@ class App(tk.Tk):
 
                 elif kind == "app_update_available":
                     self.pending_release = payload
+                    when = getattr(payload, "published", "")
                     self._append(
-                        f"ClipStash {payload.version} is available - "
-                        f"use 'Check for updates' below to install it.")
+                        f"ClipStash {payload.version} is available"
+                        + (f" (published {when})" if when else "")
+                        + " - use 'Check for updates' below to install it.")
                     if self.btn_appupdate is not None:
                         self.btn_appupdate.configure(
                             text=f"Update to {payload.version}", style="Accent.TButton")
@@ -1274,14 +1276,19 @@ class AppUpdateDialog(tk.Toplevel):
         ttk.Label(frame, textvariable=self.var_note, wraplength=400, justify="left").grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        self.notes_box = tk.Text(frame, height=6, width=52, wrap="word", state="disabled")
-        self.notes_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.notes_heading = ttk.Label(frame, text="What's new", style="Heading.TLabel",
+                                       font=("", 10, "bold"))
+        self.notes_heading.grid(row=4, column=0, sticky="w", pady=(2, 4))
+        self.notes_heading.grid_remove()
+
+        self.notes_box = tk.Text(frame, height=8, width=56, wrap="word", state="disabled")
+        self.notes_box.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         if theme:
             theme.style_text(self.notes_box)
         self.notes_box.grid_remove()
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="ew")
+        buttons.grid(row=6, column=0, columnspan=2, sticky="ew")
         self.btn_install = ttk.Button(buttons, text="Download and install", state="disabled",
                                       command=self._install, style="Accent.TButton")
         self.btn_install.pack(side="left")
@@ -1381,13 +1388,19 @@ class AppUpdateDialog(tk.Toplevel):
                     self.release = release
                     self.bar.stop()
                     self.bar.configure(mode="determinate", maximum=100, value=0)
-                    self.var_latest.set(f"Latest:  {release.version}")
+                    published = getattr(release, "published", "")
+                    self.var_latest.set(
+                        f"Latest:  {release.version}"
+                        + (f"   (published {published})" if published else ""))
                     if available:
                         size = f" ({human_bytes(release.size)})" if release.size else ""
-                        self.var_note.set(f"Version {release.version} is available{size}.")
+                        when = f", published {published}" if published else ""
+                        self.var_note.set(
+                            f"Version {release.version} is available{size}{when}.")
                         self.btn_install.configure(state="normal")
                         if release.notes:
                             self._show_notes(release.notes)
+                            self.notes_heading.grid()
                     else:
                         self.var_note.set("You're running the latest version.")
                         self.bar.configure(value=100)

@@ -62,6 +62,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -77,6 +78,23 @@ import version
 # update check will report that no update information was found.
 # ---------------------------------------------------------------------------
 UPDATE_FEED_URL = "https://github.com/Sbreland18/ClipStash/releases/latest/download/latest.json"
+
+# ---------------------------------------------------------------------------
+# Optional. With this set, the update dialog shows the release description you
+# wrote on GitHub and the date GitHub published it, rather than whatever was
+# baked into the manifest at build time. That means you can fix a typo in the
+# release notes on the website and everyone sees the correction immediately,
+# without rebuilding or republishing anything.
+#
+# Format is "owner/repo". Leave empty to rely solely on the manifest.
+#
+# This is only consulted when an update actually exists, never on an ordinary
+# launch. GitHub allows 60 unauthenticated API calls per hour per IP address,
+# and everyone behind a school or office network shares one - so calling it on
+# every startup could exhaust the quota for the whole site. Checking only when
+# there's something to report keeps usage negligible.
+# ---------------------------------------------------------------------------
+GITHUB_REPO = "Sbreland18/ClipStash"
 
 USER_AGENT = f"ClipStash/{version.__version__}"
 NETWORK_TIMEOUT = 30
@@ -94,11 +112,35 @@ class Release:
     size: int = 0
     notes: str = ""
     released: str = ""
+    notes_source: str = "manifest"   # or "github", for diagnostics
 
     @property
     def filename(self) -> str:
         name = Path(urllib.parse.urlparse(self.url).path).name
         return name or f"ClipStash-Setup-{self.version}.exe"
+
+    @property
+    def published(self) -> str:
+        """
+        The release date, written the way a person would read it.
+
+        Accepts both the plain date build.py writes ("2026-09-14") and the full
+        timestamp GitHub returns ("2026-09-14T18:22:10Z"). Anything it can't
+        parse is handed back untouched rather than discarded - a slightly odd
+        date is more use than a blank space.
+        """
+        if not self.released:
+            return ""
+        text = self.released.strip()
+        for pattern in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                moment = datetime.strptime(text, pattern)
+            except ValueError:
+                continue
+            # %-d isn't portable to Windows, so strip the zero by hand.
+            day = str(moment.day)
+            return f"{day} {moment.strftime('%B %Y')}"
+        return text
 
 
 # --------------------------------------------------------------------------- #
@@ -186,10 +228,68 @@ def fetch_release(feed_url: str = "") -> Release:
     )
 
 
-def check(feed_url: str = "") -> tuple[bool, Release]:
-    """Returns (an_update_is_available, release)."""
+def enrich_from_github(release: Release, repo: str = "") -> Release:
+    """
+    Replace the manifest's notes and date with what's on the GitHub release.
+
+    Best-effort by design. Anything that goes wrong here - no network, a rate
+    limit, a private repo, a tag that doesn't match - leaves the release exactly
+    as the manifest described it. Decorative detail must never be able to block
+    an update the user asked for.
+    """
+    target = repo or GITHUB_REPO
+    if not target:
+        return release
+
+    api = f"https://api.github.com/repos/{target}/releases/latest"
+    try:
+        request = urllib.request.Request(api, headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/vnd.github+json",
+        })
+        with urllib.request.urlopen(request, timeout=15, context=_ssl_context()) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return release
+
+    # Only trust it if GitHub is describing the same version the manifest names.
+    # A mismatch means the two are out of step, and the manifest is the one that
+    # actually points at the installer we're about to download.
+    tag = str(data.get("tag_name") or "").strip().lstrip("vV")
+    if tag and version.parse(tag) != version.parse(release.version):
+        return release
+
+    body = str(data.get("body") or "").strip()
+    published = str(data.get("published_at") or "").strip()
+
+    if body:
+        release.notes = body
+        release.notes_source = "github"
+    if published:
+        release.released = published
+
+    return release
+
+
+def check(feed_url: str = "", with_notes: bool = True) -> tuple[bool, Release]:
+    """
+    Returns (an_update_is_available, release).
+
+    GitHub is only consulted when there's genuinely an update, keeping API usage
+    near zero for the overwhelmingly common case of an app that's already
+    current.
+    """
     release = fetch_release(feed_url)
-    return version.is_newer(release.version), release
+    available = version.is_newer(release.version)
+    if available and with_notes:
+        try:
+            release = enrich_from_github(release)
+        except Exception:
+            # Belt and braces. enrich_from_github swallows its own failures, but
+            # guarding here means a future change to it can't turn cosmetic
+            # detail into something that stops an update from being offered.
+            pass
+    return available, release
 
 
 def is_configured() -> bool:
@@ -279,7 +379,12 @@ def launch_installer(installer: Path, silent: bool = True) -> None:
             "/SILENT",              # progress window, no questions
             "/SUPPRESSMSGBOXES",
             "/NORESTART",
-            "/RESTARTAPPLICATIONS",  # reopen ClipStash when it's done
+            # Explicitly ask the installer to start us again afterwards.
+            # /RESTARTAPPLICATIONS is not reliable for this: it revives apps the
+            # Restart Manager itself closed, and we exit under our own steam a
+            # moment from now, so Windows never registers us as something to
+            # bring back. installer.iss reads this parameter directly.
+            "/relaunch=1",
         ]
 
     flags = 0

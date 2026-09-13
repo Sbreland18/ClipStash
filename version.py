@@ -14,7 +14,7 @@ Use plain dotted numbers - "1.2.0", "1.2.1". Comparison is numeric per part, so
 backwards.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 def parse(text: str) -> tuple:
