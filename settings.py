@@ -50,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "cookies_file": "",
     "concurrent_fragments": 4,
     "window_geometry": "",
+    "watch_clipboard": False,
 }
 
 

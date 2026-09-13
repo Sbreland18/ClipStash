@@ -1,3 +1,10 @@
-Version 1.1.02
+Version 1.2.0
 
-- Updated colors on Queue so text is more readable.
+- Copy a YouTube link while 'Watch clipboard' is on and it queues itself
+- History window showing everything downloaded and where it was saved
+- Warns before starting if a queue looks likely to fill the drive
+- Double-click a queue row to open the folder its files went to
+- A summary at the end of a queue when something didn't work, with the
+  option to retry there and then
+- Unexpected errors now show a plain explanation and are written to the
+  log, instead of a technical error box

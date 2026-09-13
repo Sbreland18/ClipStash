@@ -50,6 +50,8 @@ hidden += [
     "version",
     "settings",
     "applog",
+    "history",
+    "crashhandler",
     "ssl",
     "hashlib",
     "zipfile",

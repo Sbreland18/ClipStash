@@ -28,6 +28,7 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -51,6 +52,16 @@ try:
     import applog
 except Exception:
     applog = None  # type: ignore[assignment]
+
+try:
+    import history as apphistory
+except Exception:
+    apphistory = None  # type: ignore[assignment]
+
+try:
+    import crashhandler
+except Exception:
+    crashhandler = None  # type: ignore[assignment]
 
 # Drag and drop needs a different root class, so this must be resolved before
 # App is defined rather than inside it. Absent the package the app is identical
@@ -241,6 +252,16 @@ HELP = {
         "Downloads often fail for temporary reasons and succeed on a second "
         "attempt. With 'Skip already downloaded' switched on, videos that worked "
         "the first time are passed over, so only the failures are retried.",
+    "watch":
+        "Watch the clipboard for links and add them to the queue on their own.\n\n"
+        "Leave this on while browsing YouTube: every time you copy a video "
+        "address, it appears in the queue here. Nothing downloads until you "
+        "press Download.\n\n"
+        "Only web addresses are picked up. Anything else you copy is ignored.",
+    "history":
+        "See everything ClipStash has downloaded, and where it saved it.\n\n"
+        "Useful for checking whether you already have something without "
+        "searching through folders.",
     "openlogs":
         "Open the folder holding ClipStash's log files.\n\n"
         "Each run is recorded to a file. If something goes wrong, the log says "
@@ -280,6 +301,53 @@ HELP = {
         "YouTube changes how it works fairly often, so if downloads suddenly stop "
         "working, updating here usually fixes it.",
 }
+
+
+# Very approximate average bitrates, in megabits per second, used only to warn
+# about free space before a queue starts. Real files vary enormously with the
+# content - a static lecture slide compresses to a fraction of a fast-moving
+# game capture - so these lean high deliberately. Warning about space that
+# turns out to be sufficient is a minor annoyance; running out halfway through
+# a 200-video playlist is not.
+QUALITY_BITRATES = {
+    "Best available": 12.0,
+    "4K (2160p) or below": 45.0,
+    "1440p or below": 24.0,
+    "1080p or below": 8.0,
+    "720p or below": 5.0,
+    "480p or below": 2.5,
+    "360p or below": 1.0,
+    "Audio only - MP3": 0.19,
+    "Audio only - original (m4a/opus)": 0.13,
+}
+
+
+def estimate_bytes(duration_seconds: int, quality: str) -> int:
+    """Rough size of a download of this length at this quality."""
+    if duration_seconds <= 0:
+        return 0
+    mbps = QUALITY_BITRATES.get(quality, 12.0)
+    return int(duration_seconds * mbps * 1_000_000 / 8)
+
+
+def free_space(folder: Path) -> int:
+    """
+    Bytes free on the drive holding `folder`.
+
+    Walks up to the nearest existing parent, since the output folder itself is
+    often created only when the download starts.
+    """
+    probe = folder
+    for _ in range(6):
+        try:
+            if probe.exists():
+                return shutil.disk_usage(str(probe)).free
+        except OSError:
+            pass
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    return -1
 
 
 def apply_cookie_opts(opts: dict[str, Any], cfg: "JobConfig") -> None:
@@ -458,6 +526,8 @@ class QueueItem:
     is_playlist: bool = False
     count: int = 0
     looked_up: bool = False
+    duration: int = 0          # seconds, used to estimate download size
+    saved_dir: str = ""        # where its files actually landed
     failed_ids: list = field(default_factory=list)
     cookie_opts: dict = field(default_factory=dict)
 
@@ -500,6 +570,15 @@ class JobConfig:
 # --------------------------------------------------------------------------- #
 # Downloader (runs off the UI thread)
 # --------------------------------------------------------------------------- #
+
+class _SilentLogger:
+    """Swallows yt-dlp output during title lookups."""
+
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
 
 class MetadataFetcher(threading.Thread):
     """
@@ -545,7 +624,8 @@ class MetadataFetcher(threading.Thread):
                 pass
 
     def _lookup(self, url: str, cookie_opts: dict) -> dict:
-        result = {"url": url, "title": "", "channel": "", "is_playlist": False, "count": 0}
+        result = {"url": url, "title": "", "channel": "", "is_playlist": False,
+                  "count": 0, "duration": 0}
         if yt_dlp is None:
             return result
 
@@ -553,6 +633,11 @@ class MetadataFetcher(threading.Thread):
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
+            # Without a logger yt-dlp still prints extraction failures straight
+            # to the console. Harmless in a windowed build with nowhere to print,
+            # but noisy when run from source, and a failed title lookup is not
+            # something to report at all - the row simply keeps showing its URL.
+            "logger": _SilentLogger(),
             # Flatten playlist members so a 200-video playlist doesn't trigger
             # 200 separate extractions just to display its name.
             "extract_flat": "in_playlist",
@@ -577,6 +662,12 @@ class MetadataFetcher(threading.Thread):
             result["is_playlist"] = True
             entries = [e for e in (info.get("entries") or []) if e]
             result["count"] = info.get("playlist_count") or len(entries)
+            # Total runtime where the flat listing provides it; this drives the
+            # free-space estimate, so a partial total is still better than none.
+            result["duration"] = int(sum(
+                (e.get("duration") or 0) for e in entries if isinstance(e, dict)))
+        else:
+            result["duration"] = int(info.get("duration") or 0)
 
         return result
 
@@ -845,6 +936,7 @@ class Downloader(threading.Thread):
         self.completed += 1
         self.out.put(("log", f"✓ [{self.completed}/{self.total}] {Path(filepath).name}"))
         self.out.put(("item_done", {"completed": self.completed, "count": self.total}))
+        self.out.put(("file_done", filepath))
 
 
 # --------------------------------------------------------------------------- #
@@ -877,6 +969,8 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.processing = False
         self.metadata = MetadataFetcher(self.queue)
         self.metadata.start()
+        self.history_window: tk.Toplevel | None = None
+        self._last_clipboard = ""
         self.last_config: JobConfig | None = None
         self.update_window: tk.Toplevel | None = None
         self.app_update_window: tk.Toplevel | None = None
@@ -891,6 +985,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.after(2500, self._start_background_check)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self.var_watch.get():
+            self._last_clipboard = self._read_clipboard()
+            self.after(1500, self._poll_clipboard)
         self._restore_geometry()
         self._register_drop_target()
 
@@ -972,6 +1069,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.var_cookiefile = tk.StringVar(value=saved("cookies_file", ""))
         self.var_frags = tk.IntVar(value=saved("concurrent_fragments", 4))
         self.var_queue = tk.StringVar(value="Queue is empty.")
+        self.var_watch = tk.BooleanVar(value=saved("watch_clipboard", False))
         self.var_version = tk.StringVar(value="")
         self.var_appversion = tk.StringVar(
             value=f"ClipStash {appversion.__version__}" if appversion else "ClipStash")
@@ -1129,6 +1227,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         tscroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=tscroll.set)
         self.tree.bind("<Delete>", lambda _e: self._remove_selected())
+        self.tree.bind("<Double-1>", self._open_item_folder)
 
         if theme:
             p = self.palette
@@ -1148,6 +1247,11 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.btn_retry = ttk.Button(qbuttons, text="Retry failed",
                                     command=self._retry_failed, state="disabled")
         self.btn_retry.pack(side="left")
+        watch_box = ttk.Checkbutton(qbuttons, text="Watch clipboard",
+                                    variable=self.var_watch, command=self._toggle_watch)
+        watch_box.pack(side="left", padx=(16, 0))
+        self._tip("watch", watch_box)
+
         ttk.Label(qbuttons, textvariable=self.var_queue, style="Muted.TLabel").pack(side="right")
         self._tip("removeitem", remove_btn)
         self._tip("clearqueue", clearq_btn)
@@ -1168,6 +1272,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         logs_btn = ttk.Button(act, text="Open logs", command=self._open_logs)
         logs_btn.pack(side="right", padx=(0, 6))
         self._tip("openlogs", logs_btn)
+        hist_btn = ttk.Button(act, text="History", command=self._open_history)
+        hist_btn.pack(side="right", padx=(0, 6))
+        self._tip("history", hist_btn)
         self._tip("download", self.btn_start)
         self._tip("cancel", self.btn_cancel)
         self._tip("openfolder", open_btn)
@@ -1283,6 +1390,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             "cookies_file": self.var_cookiefile.get().strip(),
             "concurrent_fragments": int(self.var_frags.get()),
             "window_geometry": self.geometry(),
+            "watch_clipboard": bool(self.var_watch.get()),
         }
 
     def _save_settings(self) -> None:
@@ -1372,6 +1480,104 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             if item and item not in cleaned:
                 cleaned.append(item)
         return cleaned
+
+    # -- history ------------------------------------------------------------- #
+
+    def _record_download(self, filepath: str) -> None:
+        """Note a finished file, and remember where this item's files landed."""
+        item = (self.items[self.current_index]
+                if self.current_index is not None and self.current_index < len(self.items)
+                else None)
+        if item and not item.saved_dir:
+            try:
+                item.saved_dir = str(Path(filepath).parent)
+            except Exception:
+                pass
+
+        if apphistory is None:
+            return
+        try:
+            apphistory.record(
+                filepath,
+                title=Path(filepath).stem,
+                url=item.url if item else "",
+                channel=item.channel if item else "",
+            )
+        except Exception:
+            pass   # history is a convenience, never worth interrupting a download
+
+    def _open_history(self) -> None:
+        if apphistory is None:
+            messagebox.showinfo(APP_NAME, "History isn't available in this build.")
+            return
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.lift()
+            return
+        self.history_window = HistoryDialog(self)
+
+    def _open_item_folder(self, _event=None) -> None:
+        """Double-clicking a row opens where its files went."""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if not (0 <= index < len(self.items)):
+            return
+        item = self.items[index]
+
+        folder = Path(item.saved_dir) if item.saved_dir else Path(self.var_dir.get()).expanduser()
+        if not folder.is_dir():
+            messagebox.showinfo(
+                APP_NAME,
+                "That folder doesn't exist yet.\n\nIt's created when the download starts.")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(folder)])
+            else:
+                subprocess.run(["xdg-open", str(folder)])
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't open that folder:\n\n{exc}")
+
+    # -- clipboard watching -------------------------------------------------- #
+
+    def _toggle_watch(self) -> None:
+        if self.var_watch.get():
+            # Take a reading now so whatever is already on the clipboard isn't
+            # treated as newly copied the instant the option is switched on.
+            self._last_clipboard = self._read_clipboard()
+            self._append("Watching the clipboard - copy a link to queue it.")
+            self._poll_clipboard()
+        else:
+            self._append("Stopped watching the clipboard.")
+        self._save_settings()
+
+    def _read_clipboard(self) -> str:
+        try:
+            return (self.clipboard_get() or "").strip()
+        except tk.TclError:
+            return ""   # empty, or holding something that isn't text
+
+    def _poll_clipboard(self) -> None:
+        """Check the clipboard about once a second while the option is on."""
+        if not self.var_watch.get():
+            return
+
+        current = self._read_clipboard()
+        if current and current != self._last_clipboard:
+            self._last_clipboard = current
+            urls = self._extract_urls(current)
+            known = {item.url for item in self.items}
+            fresh = [u for u in urls if u not in known]
+            if fresh:
+                added = self._enqueue_text("\n".join(fresh))
+                if added:
+                    self.var_status.set(
+                        f"Added {added} link{'s' if added != 1 else ''} from the clipboard.")
+
+        self.after(1000, self._poll_clipboard)
 
     # -- queue -------------------------------------------------------------- #
 
@@ -1597,6 +1803,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                 "to the queue.")
             return
 
+        if not self._check_disk_space():
+            return
+
         # Options are saved whenever a download starts, so a crash or power cut
         # mid-download doesn't lose the settings the user just chose.
         self._save_settings()
@@ -1606,6 +1815,47 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         self.btn_cancel.configure(state="normal")
         self.btn_retry.configure(state="disabled")
         self._process_next()
+
+    def _check_disk_space(self) -> bool:
+        """
+        Warn if the queue looks likely to fill the drive. Returns False to stop.
+
+        Only warns when there's a real reason to: an estimate can be made, and
+        it comes close to the space available. Items whose length isn't known
+        yet contribute nothing to the estimate, so this stays quiet rather than
+        guessing wildly.
+        """
+        pending = [i for i in self.items if i.status == "pending"]
+        if not pending:
+            return True
+
+        quality = self.var_quality.get()
+        estimate = sum(estimate_bytes(i.duration, quality) for i in pending)
+        unknown = sum(1 for i in pending if not i.duration)
+
+        target = Path(self.var_dir.get()).expanduser()
+        available = free_space(target)
+        if available < 0 or estimate <= 0:
+            return True   # nothing useful to say
+
+        # A margin so the drive isn't filled to the last byte.
+        margin = 500 * 1024 * 1024
+        if estimate + margin < available:
+            return True
+
+        caveat = ""
+        if unknown:
+            caveat = (f"\n\n{unknown} item(s) haven't been measured yet, so the real "
+                      "total is probably larger than this.")
+
+        return messagebox.askyesno(
+            "Not much room left",
+            f"This queue may not fit on the drive.\n\n"
+            f"Estimated download:  about {human_bytes(estimate)}\n"
+            f"Free space:  {human_bytes(available)}{caveat}\n\n"
+            "The estimate is rough, so it may well be fine. Carry on anyway?",
+            icon="warning",
+        )
 
     def _process_next(self) -> None:
         """Start the next waiting item, or finish up if there are none left."""
@@ -1629,6 +1879,21 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
             if applog:
                 applog.write(f"Queue finished: {finished} ok, {problems} problems")
             self._refresh_queue()
+
+            # Say so plainly rather than leaving someone to notice a red row or
+            # read the log. Silence on success; a prompt only when it matters.
+            if problems:
+                lines = [f"{name}: {QUEUE_STATUS.get(i.status, i.status)}"
+                         for name, i in ((it.label[:60], it) for it in self.items)
+                         if i.status in ("failed", "partial")][:8]
+                extra = "" if problems <= 8 else f"\n...and {problems - 8} more"
+                if messagebox.askyesno(
+                    "Finished, with some problems",
+                    f"{finished} download(s) completed.\n"
+                    f"{problems} had problems:\n\n" + "\n".join(lines) + extra +
+                    "\n\nTry the failed ones again now?",
+                ):
+                    self._retry_failed()
             return
 
         self.current_index = nxt
@@ -1809,6 +2074,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                             item.channel = payload["channel"]
                             item.is_playlist = payload["is_playlist"]
                             item.count = payload["count"]
+                            item.duration = payload.get("duration", 0)
                         break
                     self._refresh_queue()
 
@@ -1834,6 +2100,9 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
                         f"{human_bytes(payload['downloaded'])} of {human_bytes(payload['total'])}"
                         f"   ·   {speed}   ·   ETA {human_time(payload['eta'])}"
                     )
+
+                elif kind == "file_done":
+                    self._record_download(str(payload))
 
                 elif kind == "item_done":
                     done, count = payload["completed"], max(1, payload["count"])
@@ -1905,6 +2174,108 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         except queue.Empty:
             pass
         self.after(100, self._pump_queue)
+
+
+class HistoryDialog(tk.Toplevel):
+    """Everything ClipStash has downloaded, newest first."""
+
+    def __init__(self, parent: "App"):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Download history")
+        self.minsize(760, 420)
+        self.transient(parent)
+        if theme:
+            self.configure(background=theme.PALETTE["bg"])
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        self.var_summary = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.var_summary, style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8))
+
+        self.tree = ttk.Treeview(frame, columns=("when", "folder"), selectmode="browse")
+        self.tree.heading("#0", text="File", anchor="w")
+        self.tree.heading("when", text="Downloaded", anchor="w")
+        self.tree.heading("folder", text="Saved in", anchor="w")
+        self.tree.column("#0", anchor="w", stretch=True, minwidth=260)
+        self.tree.column("when", anchor="w", width=150, stretch=False)
+        self.tree.column("folder", anchor="w", width=230, stretch=False)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.bind("<Double-1>", lambda _e: self._open_selected())
+
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scroll.set)
+
+        if theme:
+            # Files that have since been deleted are dimmed rather than hidden:
+            # knowing something was downloaded and then removed is useful.
+            self.tree.tag_configure("missing", foreground=theme.PALETTE["dim"])
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        ttk.Button(buttons, text="Open containing folder",
+                   command=self._open_selected, style="Accent.TButton").pack(side="left")
+        ttk.Button(buttons, text="Refresh", command=self._reload).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Clear history", command=self._clear).pack(side="left")
+        ttk.Button(buttons, text="Close", command=self._close).pack(side="right")
+
+        self.entries: list = []
+        self._reload()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _reload(self) -> None:
+        self.entries = apphistory.load()
+        self.tree.delete(*self.tree.get_children())
+        missing = 0
+        for index, entry in enumerate(self.entries):
+            present = entry.exists
+            if not present:
+                missing += 1
+            size = f"  ({human_bytes(entry.size)})" if entry.size else ""
+            self.tree.insert(
+                "", "end", iid=str(index),
+                text=(entry.title or entry.filename) + size,
+                values=(entry.when_display, entry.folder),
+                tags=() if present else ("missing",),
+            )
+        total = len(self.entries)
+        if not total:
+            self.var_summary.set("Nothing downloaded yet.")
+        else:
+            note = f"   ({missing} no longer on disk)" if missing else ""
+            self.var_summary.set(f"{total} download{'s' if total != 1 else ''}{note}")
+
+    def _open_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Download history", "Pick a row first.", parent=self)
+            return
+        entry = self.entries[int(selection[0])]
+        if not apphistory.open_containing(entry):
+            messagebox.showwarning(
+                "Download history",
+                f"Couldn't open that folder. It may have been moved or deleted:\n\n{entry.folder}",
+                parent=self)
+
+    def _clear(self) -> None:
+        if not messagebox.askyesno(
+            "Clear history",
+            "Forget every entry in this list?\n\n"
+            "Your downloaded files are not touched - only this record of them.",
+            parent=self,
+        ):
+            return
+        apphistory.clear()
+        self._reload()
+
+    def _close(self) -> None:
+        self.parent.history_window = None
+        self.destroy()
 
 
 class AppUpdateDialog(tk.Toplevel):
@@ -2269,6 +2640,10 @@ def main() -> None:
     set_taskbar_identity()
     claim_app_mutex()
     app = App()
+    if crashhandler is not None:
+        # Installed after the window exists so Tk callback errors are covered
+        # too, and given a way to open the logs from the error dialog.
+        crashhandler.install(open_logs=app._open_logs, root=app)
     try:
         app.tk.call("tk", "scaling", 1.2)
     except tk.TclError:
