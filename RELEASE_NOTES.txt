@@ -1,3 +1,7 @@
-Version 1.0.3
+Version 1.1.0
 
-Fixing a bug where after update was ran, the app did not relaunch.
+- Your settings are now remembered between launches
+- Download queue: add several links and leave it running
+- Retry failed: puts anything that didn't finish back in the queue
+- Activity is recorded to a log file, reachable via the Open logs button
+- Paste button, Enter to start, and drag a link onto the window

@@ -48,6 +48,8 @@ hidden += [
     "theme",
     "app_update",
     "version",
+    "settings",
+    "applog",
     "ssl",
     "hashlib",
     "zipfile",
@@ -65,6 +67,17 @@ for optional in ("brotli", "brotlicffi", "mutagen", "Cryptodome", "websockets", 
         pass
 
 datas = collect_data_files("yt_dlp")
+
+# tkinterdnd2 ships a compiled Tcl extension that must travel with the bundle,
+# and collect_submodules alone won't bring it. Optional: without it the app runs
+# exactly the same minus drag and drop.
+try:
+    from PyInstaller.utils.hooks import collect_dynamic_libs
+    datas += collect_data_files("tkinterdnd2")
+    hidden += collect_submodules("tkinterdnd2")
+    print("[spec] bundling tkinterdnd2 for drag and drop")
+except Exception:
+    print("[spec] tkinterdnd2 not installed - drag and drop will be unavailable")
 try:
     datas += collect_data_files("certifi")
 except Exception:

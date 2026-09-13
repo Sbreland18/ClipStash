@@ -36,7 +36,8 @@ def app_version() -> str:
     except Exception:
         return "1.0.0"
 REQUIRED = ["pyinstaller", "yt-dlp"]
-RECOMMENDED = ["mutagen", "pycryptodomex", "brotli", "certifi", "websockets"]
+RECOMMENDED = ["mutagen", "pycryptodomex", "brotli", "certifi", "websockets",
+               "tkinterdnd2"]
 
 
 def _launched_by_double_click() -> bool:

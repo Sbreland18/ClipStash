@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -40,6 +41,28 @@ try:
     import theme
 except Exception:  # theming is cosmetic — never block startup over it
     theme = None  # type: ignore[assignment]
+
+try:
+    import settings as appsettings
+except Exception:
+    appsettings = None  # type: ignore[assignment]
+
+try:
+    import applog
+except Exception:
+    applog = None  # type: ignore[assignment]
+
+# Drag and drop needs a different root class, so this must be resolved before
+# App is defined rather than inside it. Absent the package the app is identical
+# minus the ability to drop a link on the window.
+try:
+    from tkinterdnd2 import TkinterDnD, DND_TEXT, DND_FILES
+    TK_BASE = TkinterDnD.Tk
+    HAVE_DND = True
+except Exception:
+    TK_BASE = tk.Tk
+    HAVE_DND = False
+    DND_TEXT = DND_FILES = None
 
 try:
     import version as appversion
@@ -194,6 +217,31 @@ HELP = {
     "sublangs":
         "Which subtitle languages to fetch, written as two-letter codes.\n\n"
         "'en' means English. Separate several with commas, like:  en,es,fr",
+    "queue":
+        "Links waiting to be downloaded, worked through one at a time.\n\n"
+        "Paste several links and leave it running. If one fails, the rest carry "
+        "on regardless.",
+    "addqueue":
+        "Add the link in the URL box to the queue.\n\n"
+        "You can also paste several links at once, one per line, or drag a link "
+        "straight onto this window.",
+    "paste":
+        "Paste a link from the clipboard into the URL box.",
+    "removeitem":
+        "Remove the selected link from the queue.\n\n"
+        "Anything already downloaded stays on your computer.",
+    "clearqueue":
+        "Empty the queue.\n\n"
+        "Only removes the list of links; downloaded files are untouched.",
+    "retryfailed":
+        "Put everything that failed back in the queue to try again.\n\n"
+        "Downloads often fail for temporary reasons and succeed on a second "
+        "attempt. With 'Skip already downloaded' switched on, videos that worked "
+        "the first time are passed over, so only the failures are retried.",
+    "openlogs":
+        "Open the folder holding ClipStash's log files.\n\n"
+        "Each run is recorded to a file. If something goes wrong, the log says "
+        "what happened and is worth sending on when reporting a problem.",
     "download":
         "Start downloading.\n\n"
         "The progress bars and the log underneath show what's happening.",
@@ -385,6 +433,34 @@ def find_ffmpeg() -> str | None:
 # --------------------------------------------------------------------------- #
 # Job configuration
 # --------------------------------------------------------------------------- #
+
+QUEUE_STATUS = {
+    "pending":   "Waiting",
+    "running":   "Downloading",
+    "done":      "Finished",
+    "partial":   "Finished with errors",
+    "failed":    "Failed",
+    "cancelled": "Cancelled",
+}
+
+
+@dataclass
+class QueueItem:
+    """One URL waiting its turn."""
+    url: str
+    status: str = "pending"
+    note: str = ""
+    title: str = ""
+    failed_ids: list = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return self.title or self.url
+
+    @property
+    def retryable(self) -> bool:
+        return self.status in ("failed", "partial", "cancelled")
+
 
 @dataclass
 class JobConfig:
@@ -680,7 +756,7 @@ class Downloader(threading.Thread):
 # GUI
 # --------------------------------------------------------------------------- #
 
-class App(tk.Tk):
+class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
@@ -688,10 +764,19 @@ class App(tk.Tk):
         self._icon_image: tk.PhotoImage | None = None
         self._apply_window_icon()
         self.palette = theme.apply(self) if theme else {}
+        self._start_session_log()
 
         self.queue: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker: Downloader | None = None
+
+        # Saved preferences are read before the widgets exist, so _build_vars
+        # can start every control at the value the user last chose.
+        self.settings = appsettings.load() if appsettings else {}
+
+        self.items: list[QueueItem] = []
+        self.current_index: int | None = None
+        self.processing = False
         self.last_config: JobConfig | None = None
         self.update_window: tk.Toplevel | None = None
         self.app_update_window: tk.Toplevel | None = None
@@ -704,6 +789,10 @@ class App(tk.Tk):
         # Let the window finish drawing before touching the network, so a slow
         # or blocked connection can't delay the app appearing.
         self.after(2500, self._start_background_check)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._restore_geometry()
+        self._register_drop_target()
 
         if yt_dlp is None:
             self.after(
@@ -758,21 +847,31 @@ class App(tk.Tk):
                 pass
 
     def _build_vars(self) -> None:
+        s = self.settings
+
+        def saved(key, fallback):
+            value = s.get(key, fallback)
+            return fallback if value is None else value
+
+        # The URL box is deliberately never restored: reopening with an old link
+        # already filled in invites downloading it again by accident.
         self.var_url = tk.StringVar()
-        self.var_dir = tk.StringVar(value=str(default_download_dir()))
-        self.var_quality = tk.StringVar(value=QUALITY_PRESETS[0])
-        self.var_items = tk.StringVar()
-        self.var_folder = tk.BooleanVar(value=True)
-        self.var_number = tk.BooleanVar(value=True)
-        self.var_archive = tk.BooleanVar(value=True)
-        self.var_subs = tk.BooleanVar(value=False)
-        self.var_sublangs = tk.StringVar(value="en")
-        self.var_metadata = tk.BooleanVar(value=True)
-        self.var_thumb = tk.BooleanVar(value=False)
-        self.var_restrict = tk.BooleanVar(value=False)
-        self.var_browser = tk.StringVar(value="None")
-        self.var_cookiefile = tk.StringVar()
-        self.var_frags = tk.IntVar(value=4)
+        self.var_dir = tk.StringVar(
+            value=saved("output_dir", "") or str(default_download_dir()))
+        self.var_quality = tk.StringVar(value=saved("quality", QUALITY_PRESETS[0]))
+        self.var_items = tk.StringVar(value=saved("playlist_items", ""))
+        self.var_folder = tk.BooleanVar(value=saved("folder_per_playlist", True))
+        self.var_number = tk.BooleanVar(value=saved("number_playlist_items", True))
+        self.var_archive = tk.BooleanVar(value=saved("use_archive", True))
+        self.var_subs = tk.BooleanVar(value=saved("write_subtitles", False))
+        self.var_sublangs = tk.StringVar(value=saved("subtitle_langs", "en"))
+        self.var_metadata = tk.BooleanVar(value=saved("embed_metadata", True))
+        self.var_thumb = tk.BooleanVar(value=saved("embed_thumbnail", False))
+        self.var_restrict = tk.BooleanVar(value=saved("restrict_filenames", False))
+        self.var_browser = tk.StringVar(value=saved("cookies_browser", "None"))
+        self.var_cookiefile = tk.StringVar(value=saved("cookies_file", ""))
+        self.var_frags = tk.IntVar(value=saved("concurrent_fragments", 4))
+        self.var_queue = tk.StringVar(value="Queue is empty.")
         self.var_version = tk.StringVar(value="")
         self.var_appversion = tk.StringVar(
             value=f"ClipStash {appversion.__version__}" if appversion else "ClipStash")
@@ -796,7 +895,8 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(4, weight=1)
+        root.rowconfigure(2, weight=1)   # queue
+        root.rowconfigure(5, weight=2)   # log, given the larger share
 
         # --- Source -------------------------------------------------------- #
         src = ttk.LabelFrame(root, text="Source", padding=10)
@@ -806,9 +906,23 @@ class App(tk.Tk):
         url_label = ttk.Label(src, text="URL")
         url_label.grid(row=0, column=0, sticky="w", **pad)
         url_entry = ttk.Entry(src, textvariable=self.var_url)
-        url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        url_entry.grid(row=0, column=1, sticky="ew", **pad)
         url_entry.focus_set()
+        self.url_entry = url_entry
         self._tip("url", url_label, url_entry)
+
+        url_buttons = ttk.Frame(src)
+        url_buttons.grid(row=0, column=2, sticky="w", **pad)
+        paste_btn = ttk.Button(url_buttons, text="Paste", width=7, command=self._paste_url)
+        paste_btn.pack(side="left")
+        add_btn = ttk.Button(url_buttons, text="Add to queue", command=self._add_to_queue)
+        add_btn.pack(side="left", padx=(6, 0))
+        self._tip("paste", paste_btn)
+        self._tip("addqueue", add_btn)
+
+        # Enter starts a download from the URL box, which is what people expect
+        # after typing or pasting a link.
+        url_entry.bind("<Return>", lambda _e: self._start())
 
         dir_label = ttk.Label(src, text="Save to")
         dir_label.grid(row=1, column=0, sticky="w", **pad)
@@ -894,9 +1008,52 @@ class App(tk.Tk):
         sublang_entry.grid(row=2, column=1, sticky="w", pady=(6, 0))
         self._tip("sublangs", sublang_label, sublang_entry)
 
+        # --- Queue --------------------------------------------------------- #
+        qframe = ttk.LabelFrame(root, text="Queue", padding=8)
+        qframe.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
+        qframe.columnconfigure(0, weight=1)
+        qframe.rowconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(qframe, columns=("status",), height=5,
+                                 selectmode="extended")
+        self.tree.heading("#0", text="Link", anchor="w")
+        self.tree.heading("status", text="Status", anchor="w")
+        self.tree.column("#0", anchor="w", stretch=True, minwidth=220)
+        self.tree.column("status", anchor="w", width=170, stretch=False)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        self._tip("queue", self.tree)
+
+        tscroll = ttk.Scrollbar(qframe, orient="vertical", command=self.tree.yview)
+        tscroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tscroll.set)
+        self.tree.bind("<Delete>", lambda _e: self._remove_selected())
+
+        if theme:
+            p = self.palette
+            self.tree.tag_configure("done", foreground=p["ok"])
+            self.tree.tag_configure("failed", foreground=p["error"])
+            self.tree.tag_configure("partial", foreground=p["warn"])
+            self.tree.tag_configure("running", foreground=p["info_hi"])
+            self.tree.tag_configure("cancelled", foreground=p["muted"])
+            self.tree.tag_configure("pending", foreground=p["fg"])
+
+        qbuttons = ttk.Frame(qframe)
+        qbuttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        remove_btn = ttk.Button(qbuttons, text="Remove", command=self._remove_selected)
+        remove_btn.pack(side="left")
+        clearq_btn = ttk.Button(qbuttons, text="Clear queue", command=self._clear_queue)
+        clearq_btn.pack(side="left", padx=6)
+        self.btn_retry = ttk.Button(qbuttons, text="Retry failed",
+                                    command=self._retry_failed, state="disabled")
+        self.btn_retry.pack(side="left")
+        ttk.Label(qbuttons, textvariable=self.var_queue, style="Muted.TLabel").pack(side="right")
+        self._tip("removeitem", remove_btn)
+        self._tip("clearqueue", clearq_btn)
+        self._tip("retryfailed", self.btn_retry)
+
         # --- Actions ------------------------------------------------------- #
         act = ttk.Frame(root)
-        act.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        act.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         self.btn_start = ttk.Button(act, text="Download", command=self._start,
                                     style="Accent.TButton")
         self.btn_start.pack(side="left")
@@ -906,6 +1063,9 @@ class App(tk.Tk):
         open_btn.pack(side="left")
         clear_btn = ttk.Button(act, text="Clear log", command=self._clear_log)
         clear_btn.pack(side="right")
+        logs_btn = ttk.Button(act, text="Open logs", command=self._open_logs)
+        logs_btn.pack(side="right", padx=(0, 6))
+        self._tip("openlogs", logs_btn)
         self._tip("download", self.btn_start)
         self._tip("cancel", self.btn_cancel)
         self._tip("openfolder", open_btn)
@@ -913,7 +1073,7 @@ class App(tk.Tk):
 
         # --- Progress ------------------------------------------------------ #
         prog = ttk.Frame(root)
-        prog.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        prog.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         prog.columnconfigure(0, weight=1)
 
         ttk.Label(prog, textvariable=self.var_status, style="Heading.TLabel",
@@ -935,7 +1095,7 @@ class App(tk.Tk):
 
         # --- Log ----------------------------------------------------------- #
         logframe = ttk.LabelFrame(root, text="Log", padding=6)
-        logframe.grid(row=4, column=0, sticky="nsew")
+        logframe.grid(row=5, column=0, sticky="nsew")
         logframe.columnconfigure(0, weight=1)
         logframe.rowconfigure(0, weight=1)
 
@@ -956,7 +1116,7 @@ class App(tk.Tk):
 
         # --- Footer -------------------------------------------------------- #
         footer = ttk.Frame(root)
-        footer.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        footer.grid(row=6, column=0, sticky="ew", pady=(8, 0))
 
         app_label = ttk.Label(footer, textvariable=self.var_appversion, style="Muted.TLabel")
         app_label.pack(side="left")
@@ -979,6 +1139,247 @@ class App(tk.Tk):
             self._tip("appupdate", self.btn_appupdate)
 
         self._refresh_version_label()
+
+    def _restore_geometry(self) -> None:
+        """Reopen at the size the user left it, if it still fits on screen."""
+        geometry = (self.settings or {}).get("window_geometry", "")
+        if not geometry:
+            return
+        try:
+            size = geometry.split("+")[0]
+            width, height = (int(n) for n in size.split("x"))
+            if 600 <= width <= self.winfo_screenwidth() and 400 <= height <= self.winfo_screenheight():
+                self.geometry(geometry)
+        except Exception:
+            pass  # a nonsense saved geometry just means default sizing
+
+    def _register_drop_target(self) -> None:
+        if not HAVE_DND:
+            return
+        try:
+            self.drop_target_register(DND_TEXT, DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            pass
+
+    # -- settings ----------------------------------------------------------- #
+
+    def _collect_settings(self) -> dict:
+        return {
+            "output_dir": self.var_dir.get().strip(),
+            "quality": self.var_quality.get(),
+            "playlist_items": self.var_items.get().strip(),
+            "folder_per_playlist": bool(self.var_folder.get()),
+            "number_playlist_items": bool(self.var_number.get()),
+            "use_archive": bool(self.var_archive.get()),
+            "write_subtitles": bool(self.var_subs.get()),
+            "subtitle_langs": self.var_sublangs.get().strip(),
+            "embed_metadata": bool(self.var_metadata.get()),
+            "embed_thumbnail": bool(self.var_thumb.get()),
+            "restrict_filenames": bool(self.var_restrict.get()),
+            "cookies_browser": self.var_browser.get(),
+            "cookies_file": self.var_cookiefile.get().strip(),
+            "concurrent_fragments": int(self.var_frags.get()),
+            "window_geometry": self.geometry(),
+        }
+
+    def _save_settings(self) -> None:
+        if appsettings is None:
+            return
+        try:
+            appsettings.save(self._collect_settings())
+        except Exception:
+            pass  # preferences are a convenience, never worth an error dialog
+
+    def _on_close(self) -> None:
+        """Save preferences, then leave - warning first if work is in progress."""
+        if self.processing:
+            if not messagebox.askyesno(
+                APP_NAME,
+                "A download is still running.\n\nClose ClipStash anyway?",
+            ):
+                return
+            self.cancel_event.set()
+        self._save_settings()
+        if applog:
+            applog.write("ClipStash closed")
+        self.destroy()
+
+    # -- session log -------------------------------------------------------- #
+
+    def _start_session_log(self) -> None:
+        if applog is None:
+            return
+        try:
+            log = applog.session()
+            log.header(
+                appversion.__version__ if appversion else "unknown",
+                yt_dlp.version.__version__ if yt_dlp else "not installed",
+                find_ffmpeg(),
+            )
+        except Exception:
+            pass
+
+    def _open_logs(self) -> None:
+        if applog is None or not applog.open_folder():
+            messagebox.showinfo(APP_NAME, "The log folder isn't available in this build.")
+
+    # -- conveniences ------------------------------------------------------- #
+
+    def _paste_url(self) -> None:
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            messagebox.showinfo(APP_NAME, "There's nothing on the clipboard to paste.")
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        # Several links at once go straight to the queue; a single one lands in
+        # the box so it can still be looked at before starting.
+        if len(self._extract_urls(text)) > 1:
+            self._enqueue_text(text)
+        else:
+            self.var_url.set(text)
+
+    def _on_drop(self, event) -> None:
+        """A link or file dropped onto the window."""
+        data = getattr(event, "data", "") or ""
+        # Tk wraps paths containing spaces in braces; strip them before parsing.
+        data = data.replace("{", " ").replace("}", " ")
+        found = self._extract_urls(data)
+        if not found:
+            self._append("WARNING: Nothing that looks like a link was dropped.")
+            return
+        if len(found) == 1 and not self.var_url.get().strip():
+            self.var_url.set(found[0])
+        else:
+            self._enqueue_text(data)
+
+    @staticmethod
+    def _extract_urls(text: str) -> list[str]:
+        """Pull every http(s) link out of arbitrary pasted or dropped text."""
+        found = re.findall(r'https?://\S+', text or "")
+        cleaned = []
+        for item in found:
+            item = item.strip().strip('\'\"<>,;')
+            if item and item not in cleaned:
+                cleaned.append(item)
+        return cleaned
+
+    # -- queue -------------------------------------------------------------- #
+
+    def _enqueue_text(self, text: str) -> int:
+        """Add every link found in some text. Returns how many were added."""
+        added = 0
+        existing = {item.url for item in self.items}
+        for url in self._extract_urls(text):
+            if url in existing:
+                continue
+            self.items.append(QueueItem(url=url))
+            existing.add(url)
+            added += 1
+        if added:
+            self._refresh_queue()
+            self._append(f"Added {added} link{'s' if added != 1 else ''} to the queue.")
+        return added
+
+    def _add_to_queue(self) -> None:
+        raw = self.var_url.get().strip()
+        if not raw:
+            messagebox.showinfo(APP_NAME, "Put a link in the URL box first.")
+            return
+        found = self._extract_urls(raw)
+        if not found:
+            # Not a recognisable link, but yt-dlp accepts more than plain URLs,
+            # so it's queued as typed rather than rejected outright.
+            self.items.append(QueueItem(url=raw))
+            self._refresh_queue()
+        else:
+            self._enqueue_text(raw)
+        self.var_url.set("")
+
+    def _refresh_queue(self) -> None:
+        """Redraw the queue list and the counts beside it."""
+        selected = set(self.tree.selection())
+        self.tree.delete(*self.tree.get_children())
+        for index, item in enumerate(self.items):
+            note = f"  -  {item.note}" if item.note else ""
+            self.tree.insert(
+                "", "end", iid=str(index), text=item.label,
+                values=(QUEUE_STATUS.get(item.status, item.status) + note,),
+                tags=(item.status,),
+            )
+        for iid in selected:
+            if self.tree.exists(iid):
+                self.tree.selection_add(iid)
+
+        if not self.items:
+            self.var_queue.set("Queue is empty.")
+        else:
+            counts = {}
+            for item in self.items:
+                counts[item.status] = counts.get(item.status, 0) + 1
+            parts = [f"{n} {QUEUE_STATUS.get(k, k).lower()}" for k, n in counts.items()]
+            self.var_queue.set(f"{len(self.items)} in queue  ({', '.join(parts)})")
+
+        self.btn_retry.configure(
+            state="normal" if any(i.retryable for i in self.items) and not self.processing
+            else "disabled")
+
+    def _remove_selected(self) -> None:
+        chosen = sorted((int(i) for i in self.tree.selection()), reverse=True)
+        if not chosen:
+            return
+        for index in chosen:
+            if index == self.current_index and self.processing:
+                continue  # can't remove the one being downloaded
+            if 0 <= index < len(self.items):
+                del self.items[index]
+        self.current_index = None
+        self._refresh_queue()
+
+    def _clear_queue(self) -> None:
+        if self.processing:
+            messagebox.showinfo(APP_NAME, "Stop the current download before clearing the queue.")
+            return
+        self.items.clear()
+        self._refresh_queue()
+
+    def _retry_failed(self) -> None:
+        """
+        Requeue everything that didn't finish.
+
+        Individual videos that failed inside a playlist are added as their own
+        links, so a retry fetches exactly those rather than walking the whole
+        playlist again. Where no specific video could be identified, the original
+        link is retried instead; with 'Skip already downloaded' switched on,
+        yt-dlp passes over whatever already succeeded.
+        """
+        retried = 0
+        existing = {item.url for item in self.items if item.status == "pending"}
+
+        for item in list(self.items):
+            if not item.retryable:
+                continue
+            for video_id in item.failed_ids:
+                url = f"https://www.youtube.com/watch?v={video_id}"
+                if url not in existing:
+                    self.items.append(QueueItem(url=url))
+                    existing.add(url)
+                    retried += 1
+            if not item.failed_ids and item.url not in existing:
+                self.items.append(QueueItem(url=item.url))
+                existing.add(item.url)
+                retried += 1
+
+        if not retried:
+            messagebox.showinfo(APP_NAME, "Nothing to retry.")
+            return
+
+        self._refresh_queue()
+        self._append(f"Requeued {retried} item{'s' if retried != 1 else ''} to retry.")
+        self._start()
 
     def _choose_dir(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.var_dir.get() or str(Path.home()))
@@ -1026,20 +1427,82 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+        if line.lower().startswith("error:"):
+            self._record_failed_video(line)
+
+        if applog is not None:
+            level = "ERROR" if tag == ("error",) else "WARN" if tag == ("warn",) else "INFO"
+            applog.write(line, level)
+
     def _start(self) -> None:
+        """Begin working through the queue, adding the URL box first if filled."""
         if yt_dlp is None:
             messagebox.showerror(APP_NAME, "yt-dlp is not installed.\n\npip install -U yt-dlp")
             return
-        url = self.var_url.get().strip()
-        if not url:
-            messagebox.showwarning(APP_NAME, "Paste a video or playlist URL first.")
+        if self.processing:
             return
         if not self.var_dir.get().strip():
             messagebox.showwarning(APP_NAME, "Choose a folder to save into.")
             return
 
+        typed = self.var_url.get().strip()
+        if typed:
+            self._add_to_queue()
+
+        if not any(item.status == "pending" for item in self.items):
+            messagebox.showinfo(
+                APP_NAME,
+                "Nothing to download.\n\nPaste a link in the URL box, or add links "
+                "to the queue.")
+            return
+
+        # Options are saved whenever a download starts, so a crash or power cut
+        # mid-download doesn't lose the settings the user just chose.
+        self._save_settings()
+
+        self.processing = True
+        self.btn_start.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        self.btn_retry.configure(state="disabled")
+        self._process_next()
+
+    def _process_next(self) -> None:
+        """Start the next waiting item, or finish up if there are none left."""
+        nxt = next((i for i, item in enumerate(self.items)
+                    if item.status == "pending"), None)
+
+        if nxt is None:
+            self.processing = False
+            self.current_index = None
+            self.btn_start.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            self.bar_item["value"] = 0
+            self.bar_overall["value"] = 0
+
+            finished = sum(1 for i in self.items if i.status == "done")
+            problems = sum(1 for i in self.items if i.status in ("failed", "partial"))
+            self.var_status.set(
+                f"Queue finished. {finished} completed"
+                + (f", {problems} with problems." if problems else "."))
+            self._append(f"Queue finished - {finished} completed, {problems} with problems.")
+            if applog:
+                applog.write(f"Queue finished: {finished} ok, {problems} problems")
+            self._refresh_queue()
+            return
+
+        self.current_index = nxt
+        item = self.items[nxt]
+        item.status = "running"
+        item.failed_ids = []
+        self._refresh_queue()
+        self.tree.see(str(nxt))
+
+        self._append(f"--- {item.url} ---")
+        if applog:
+            applog.write(f"Starting: {item.url}")
+
         config = JobConfig(
-            url=url,
+            url=item.url,
             output_dir=Path(self.var_dir.get()).expanduser(),
             quality=self.var_quality.get(),
             playlist_items=self.var_items.get(),
@@ -1146,9 +1609,42 @@ class App(tk.Tk):
         self.btn_cancel.configure(state="disabled")
 
     def _finish(self) -> None:
-        self.btn_start.configure(state="normal")
-        self.btn_cancel.configure(state="disabled")
+        """One queue item ended. Buttons stay disabled while more remain."""
         self.worker = None
+        if not self.processing:
+            self.btn_start.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            self._refresh_queue()
+
+    def _mark_current(self, status: str, note: str = "") -> None:
+        if self.current_index is None or not (0 <= self.current_index < len(self.items)):
+            return
+        item = self.items[self.current_index]
+        item.status = status
+        item.note = note
+        self._refresh_queue()
+        if applog:
+            applog.write(f"{item.url} -> {status}{(' (' + note + ')') if note else ''}")
+
+    def _record_failed_video(self, line: str) -> None:
+        """
+        Note individual videos that failed inside a playlist.
+
+        yt-dlp reports these as lines like "ERROR: [youtube] dQw4w9WgXcQ: ...".
+        Capturing the id means Retry can fetch exactly those, instead of walking
+        the entire playlist again.
+        """
+        if self.current_index is None:
+            return
+        match = re.search(r'\[youtube[^\]]*\]\s+([A-Za-z0-9_-]{11})', line)
+        if not match:
+            match = re.search(r'watch\?v=([A-Za-z0-9_-]{11})', line)
+        if not match:
+            return
+        item = self.items[self.current_index]
+        video_id = match.group(1)
+        if video_id not in item.failed_ids:
+            item.failed_ids.append(video_id)
 
     # -- UI queue pump ------------------------------------------------------ #
 
@@ -1192,6 +1688,10 @@ class App(tk.Tk):
                     self.var_status.set("Cancelled.")
                     self.var_detail.set("")
                     self._append("Cancelled by user.")
+                    self._mark_current("cancelled")
+                    # Cancel stops the whole queue, not just this item - someone
+                    # pressing Cancel wants everything to stop.
+                    self.processing = False
                     self._finish()
 
                 elif kind == "app_update_available":
@@ -1216,18 +1716,35 @@ class App(tk.Tk):
                     self.var_status.set("Failed.")
                     self.var_detail.set("")
                     self._append(f"ERROR: {payload}")
-                    messagebox.showerror(APP_NAME, str(payload))
+                    self._mark_current("failed", str(payload)[:80])
                     self._finish()
+                    # No dialog when a queue is running: one bad link in twenty
+                    # shouldn't stop the batch and wait for someone to click OK.
+                    if self.processing:
+                        self._process_next()
+                    else:
+                        messagebox.showerror(APP_NAME, str(payload))
 
                 elif kind == "done":
                     self.bar_item["value"] = 100
                     self.bar_overall["value"] = 100
-                    self.var_status.set("Finished.")
                     self.var_detail.set("")
                     self._append(
-                        f"Done — {payload['completed']} file(s) in {human_time(payload['elapsed'])}."
+                        f"Done - {payload['completed']} file(s) in {human_time(payload['elapsed'])}."
                     )
+                    failures = payload.get("failed", 0)
+                    current = (self.items[self.current_index]
+                               if self.current_index is not None
+                               and self.current_index < len(self.items) else None)
+                    if current and (failures or current.failed_ids):
+                        count = len(current.failed_ids) or failures
+                        self._mark_current("partial", f"{count} item(s) failed")
+                    else:
+                        self._mark_current("done", f"{payload['completed']} file(s)")
+                    self.var_status.set("Finished.")
                     self._finish()
+                    if self.processing:
+                        self._process_next()
 
         except queue.Empty:
             pass
