@@ -133,10 +133,11 @@ Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExeName}"; Tasks: deskt
 ; Manual install: offered as a tick box on the final page.
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
-; In-app update: ClipStash launches Setup with /relaunch=1 and then exits, so
-; there is nothing on screen to tick. This entry reopens it automatically.
-; Guarded by the Check so a normal interactive install can't start it twice.
-Filename: "{app}\{#AppExeName}"; Flags: nowait postinstall; Check: RelaunchRequested
+; In-app update: ClipStash launches Setup silently and then exits, so there is
+; no Finished page to tick. This entry reopens it automatically.
+; runasoriginaluser matters if the install was elevated - without it the
+; relaunched app would inherit administrator rights, which it has no need for.
+Filename: "{app}\{#AppExeName}"; Flags: nowait postinstall runasoriginaluser; Check: ShouldAutoLaunch
 
 [UninstallDelete]
 ; PyInstaller's onefile bootloader and the updater both write outside {app}.
@@ -166,11 +167,19 @@ const
   darkening those pages would leave black text on a dark background. The header
   is safe because it contains nothing but two labels and our small bitmap,
   which already has a matching navy background and so blends into it. }
-{ True only when ClipStash started this installer as part of an in-app update.
-  Reads the /relaunch=1 switch passed by app_update.launch_installer. }
-function RelaunchRequested: Boolean;
+{ Should Setup reopen ClipStash when it finishes?
+
+  Yes in two cases. A silent install is only ever started by ClipStash updating
+  itself - nobody runs Setup silently by hand - so silence alone is a reliable
+  signal that an app is waiting to come back. The explicit /relaunch=1 switch is
+  also honoured, which is what current versions pass.
+
+  Checking WizardSilent as well as the switch matters for anyone updating from
+  an older build: versions before 1.0.2 never sent the switch, so keying off it
+  alone would leave them staring at a closed app after every update. }
+function ShouldAutoLaunch: Boolean;
 begin
-  Result := ExpandConstant('{param:relaunch|0}') = '1';
+  Result := WizardSilent or (ExpandConstant('{param:relaunch|0}') = '1');
 end;
 
 procedure InitializeWizard();

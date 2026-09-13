@@ -1,5 +1,3 @@
-Version 1.0.2
+Version 1.0.3
 
-App will now relaunch when updated.
-Release notes are displayed when updating.
-Date of version release/update will now be displayed.
+Fixing a bug where after update was ran, the app did not relaunch.
