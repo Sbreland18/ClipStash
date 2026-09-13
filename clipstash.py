@@ -41,6 +41,13 @@ try:
 except Exception:  # theming is cosmetic — never block startup over it
     theme = None  # type: ignore[assignment]
 
+try:
+    import version as appversion
+    import app_update
+except Exception:  # self-update is optional; the app must still run without it
+    appversion = None  # type: ignore[assignment]
+    app_update = None  # type: ignore[assignment]
+
 # Must run before yt_dlp is imported: swaps in a newer downloaded copy if one
 # exists, otherwise leaves the bundled version in charge.
 try:
@@ -694,6 +701,9 @@ class App(tk.Tk):
         self._build_vars()
         self._build_ui()
         self.after(100, self._pump_queue)
+        # Let the window finish drawing before touching the network, so a slow
+        # or blocked connection can't delay the app appearing.
+        self.after(2500, self._start_background_check)
 
         if yt_dlp is None:
             self.after(
