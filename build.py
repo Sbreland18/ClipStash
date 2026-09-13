@@ -474,6 +474,16 @@ def write_update_manifest(release: str) -> None:
     if not notes:
         warn("No RELEASE_NOTES.txt found - the manifest will have empty notes. "
              "Create that file to tell people what changed.")
+    else:
+        # Catch the easy mistake of shipping the previous release's text. The
+        # notes are baked into the manifest at build time, so stale text here
+        # is what every user reads in the update dialog.
+        mentioned = re.findall(r'\b\d+\.\d+(?:\.\d+)?\b', notes)
+        if mentioned and release not in mentioned:
+            warn(f"RELEASE_NOTES.txt mentions version {mentioned[0]} but you're "
+                 f"building {release}.")
+            warn("  Those notes are what users see in the update dialog. Update "
+                 "RELEASE_NOTES.txt and rebuild if this is last release's text.")
 
     manifest = {
         "version": release,
@@ -543,6 +553,19 @@ def report() -> None:
     log("Artifacts:")
     for item in sorted(dist.iterdir()):
         log(f"  {item.name}  —  {human_size(dir_size(item))}")
+
+    # A folder build's exe is only a launcher; the runtime lives beside it in
+    # _internal. Moving the exe alone gives "Failed to load Python DLL", which
+    # reads like a broken build rather than a misplaced file.
+    folder_build = (dist / APP_NAME / "_internal").is_dir()
+    if folder_build:
+        print()
+        log("This is a folder build: ClipStash.exe and the _internal folder are")
+        log("one unit. Copying the exe on its own causes a 'Failed to load Python")
+        log("DLL' error. To test the build, run it in place:")
+        log(f"    {dist / APP_NAME / (APP_NAME + '.exe')}")
+        log("To use it elsewhere, copy the whole folder - or install it properly")
+        log("with the installer.")
 
     if sys.platform == "darwin":
         app = dist / f"{APP_NAME}.app"
