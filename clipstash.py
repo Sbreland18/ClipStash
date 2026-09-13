@@ -855,7 +855,10 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.minsize(760, 620)
+        # Raised when the queue panel was added: below roughly this height the
+        # queue and log both get squeezed to nothing, since they are the two
+        # rows that absorb spare space.
+        self.minsize(820, 780)
         self._icon_image: tk.PhotoImage | None = None
         self._apply_window_icon()
         self.palette = theme.apply(self) if theme else {}
@@ -1109,7 +1112,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         qframe = ttk.LabelFrame(root, text="Queue", padding=8)
         qframe.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
         qframe.columnconfigure(0, weight=1)
-        qframe.rowconfigure(0, weight=1)
+        qframe.rowconfigure(0, weight=1, minsize=130)
 
         self.tree = ttk.Treeview(qframe, columns=("channel", "status"), height=5,
                                  selectmode="extended")
@@ -1196,7 +1199,7 @@ class App(TK_BASE):  # tk.Tk, or TkinterDnD.Tk when drag and drop is available
         logframe = ttk.LabelFrame(root, text="Log", padding=6)
         logframe.grid(row=5, column=0, sticky="nsew")
         logframe.columnconfigure(0, weight=1)
-        logframe.rowconfigure(0, weight=1)
+        logframe.rowconfigure(0, weight=1, minsize=120)
 
         self.log = tk.Text(logframe, height=12, wrap="none", state="disabled")
         self.log.grid(row=0, column=0, sticky="nsew")

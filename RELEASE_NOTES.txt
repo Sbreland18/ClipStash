@@ -1,9 +1,3 @@
-Version 1.1.01
+Version 1.1.02
 
-- Your settings are now remembered between launches
-- Download queue: add several links and leave it running
-- The queue shows video and playlist titles, channel names, and how many
-  videos a playlist contains
-- Retry failed: puts anything that didn't finish back in the queue
-- Activity is recorded to a log file, reachable via the Open logs button
-- Paste button, Enter to start, and drag a link onto the window
+- Updated colors on Queue so text is more readable.
